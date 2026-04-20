@@ -13,126 +13,182 @@ import datetime as dt
 import matplotlib.pyplot as plt
 import itertools
 import optuna
+optuna.logging.set_verbosity(optuna.logging.WARNING)  # Suppress detailed logs
 import networkx as nx
+
+import skmob
+from sklearn.metrics import r2_score
+
 
 from collections import Counter
 from collections import OrderedDict
 
+import seaborn as sns
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap, BoundaryNorm
+from matplotlib.colors import Normalize, LogNorm, SymLogNorm
+import matplotlib.patches as mpatches
+import matplotlib.gridspec as gridspec
+from matplotlib.ticker import NullFormatter
+import matplotlib as mpl
+import matplotlib.ticker as mticker
+from matplotlib.colors import Colormap, ListedColormap
+from matplotlib.path import Path        # <-- Path defined here
+from matplotlib.markers import MarkerStyle
+import matplotlib.cm as cm
+import matplotlib.patches as patches
+from matplotlib.lines import Line2D
+import matplotlib.ticker as ticker
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 from . import config
 
-optuna.logging.set_verbosity(optuna.logging.WARNING)  # Suppress detailed logs
+#####################################
+#### MOBILITY DATA PREPROCESSING ####
+#################################k####
 
-DICT_paths = {'TMP': '/home/fedde/work/Project_Penn/TMP/', 
-              'Data': '/home/fedde/work/Project_Penn/Data/'}
-
-
-class KIT_conversion_dates:
-    """Utilities to handle date-range arrays"""
-
-    #hourofday-weekperiod coverage
-    def get_hourofday_weekperiod(v):
-        '''
-        v : date-range series (will be converted to pandas datetime)
-        gen hourofday_weekperiod column
-        '''
-        v = pd.to_datetime(v)
-        _wdays = [0,1,2,3,4,5]
-        _wperiod = np.array(['weekend','weekday'])
-        
-        return [f"{t}_{_wperiod[w*1]}" for t,w in zip(v.hour, v.weekday.isin(_wdays))] 
-
-    def split_df_hourofday_weekperiod(df, 
-                                      column = 'hourofday_weekperiod'):
-        '''
-        split the column in 2 cols
-        '''
-        #split into two columns
-        df[['hourofday', 'weekperiod']] = df['hourofday_weekperiod'].str.split('_', expand=True)
-        #cast hourofday to integer
-        df['hourofday'] = df['hourofday'].astype(int)
-        
-    def convert_daterange_from_weekday(Date_range):
-        '''
-        given data-range let the first entry start from a weekday
-        '''
-        idx = 0
-        while idx < len(Date_range) and Date_range[idx].weekday() >= 5:  # Skip weekends
-            idx += 1
-        return Date_range[(idx):]
-
-
-class KIT_conversion_coordinates:
-    """Utilities to make coordinate conversions"""
+def preprocess_GPS_mobility_trajectory(traj, 
+                                       tz = None):
+    """
+    INPUT: 
+    > traj : dataframe for a single individual GPS trajectory 
+        contains columns ['id', 'time_utc', 'lat', 'lon'] 
+    > tz : timezone
     
-    def ConvertCoordinate_4326(lat, lon):
-        '''
-        function for conversion from crs:3857 to crs:4326
-        '''
-        
-        latInEPSG4326 = (180 / math.pi) * (2 * math.atan(math.exp(lat * math.pi / 20037508.34)) - (math.pi / 2))
-        lonInEPSG4326 = lon / (20037508.34 / 180)
-        
-        return latInEPSG4326, lonInEPSG4326
+    Preprocess GPS trajectory:
+    - build TrajDataFrame
+    - filter unrealistic speeds (max speed 100kmh)
+    - convert timezone (optional)
+    - downsample to 1-minute resolution
+    """
 
-    def ConvertCoordinate_3587(lat, lon):
-        '''
-        conversion from crs:4326 to crs:3587
-        '''
-        
-        latInEPSG3857 = (math.log(math.tan((90 + lat) * math.pi / 360)) / (math.pi / 180)) * (20037508.34 / 180)
-        lonInEPSG3857 = (lon* 20037508.34 / 180)
-        
-        return latInEPSG3857, lonInEPSG3857
- 
-    def convert_df_coord_4326(df_loc, lat = 'lat', lon = 'lon'):
-        '''
-        convert df coordinate from crs:3857 to crs:4326    
-        '''
-        df_loc[[lat, lon]] = df_loc.apply(lambda row: ConvertCoordinate_4326(row[lat], row[lon]), axis=1, result_type='expand')
-        
-    def convert_df_coord_3587(df_loc, lat= 'lat', lon = 'lon'): 
-        '''
-        convert df coordinate from crs:4326 to crs:3587    
-        '''
-        df_loc[[lat, lon]] = df_loc.apply(lambda row: ConvertCoordinate_3587(row[lat], row[lon]), axis=1, result_type='expand')
+    # Build TrajDataFrame (WGS84)
+    traj_df = skmob.TrajDataFrame(
+        traj.rename(columns={'lon': 'lng', 'time_utc': 'datetime'}),
+        latitude='lat',
+        longitude='lng',
+        datetime='datetime',
+        timestamp=True
+    )
 
+    #Remove speeds > 100 km/h
+    traj_df = skmob.preprocessing.filtering.filter(traj_df, 
+                                                   max_speed_kmh = 100)
+    traj_df.rename(columns = {'lng':'lat', 
+                              'id':'user_id'})
 
+    #Parse timestamps as UTC
+    dt = pd.to_datetime(traj_df['datetime'], utc = True)
+    #convert to the local hour of the timezone tz
+    dt = dt.dt.tz_convert(tz)
+    dt = dt.dt.tz_localize(None)
 
-#############################################
-###### COORDINATE CONVERSION FUNCTIONS ######
-#############################################
+    
+    #Downsample to 1-minute resolution
+    traj_df['datetime'] = dt.dt.floor('min', ambiguous = True)
+    
+    #Drop duplicates
+    traj_df = traj_df.drop_duplicates(subset=['datetime'])
 
-def get_table_count(df, x, y):
-    return df.groupby([x,y]).size().reset_index().pivot(index = x, columns = y, values = 0).fillna(0)
+    return traj_df
 
-def subset_df_feature(df,f):
+#####################################################
+#### CREATE SEQUENCE OF HOURLY RECORD INDICATORS ####
+#####################################################
+
+def collect_sequences(traj_sample, 
+                      Study_period, 
+                      Time_range):
     '''
-    df : dataframe
-    f  : feature name 
+    traj_sample : df with columns ['id', 'datetime']
+    Study_period : list with start and end day of study period
+    Time_range : list with start and end day of the broader time-range
+    
+    The function collect_sequences builds hourly record indicators (HRI) from GPS trajectories for 28-day sequences 
+    which correspond to the Study_period [2014/02/08 - 2015/03/07] or to shifted sequences -- which start on 
+    the same weekday of the first day of the  Study_period -- collected over the broader Time_Range [2014/02/01 - 2015/02/01].
+    
+    For each id, it marks presence of records (boolean 1 or 0) at every hour.
+    (1) it scans the Time_range to find _candidate start days_ that:
+        - Have the same weekday alignment with the start of the Study_period with a window of length of 28 days
+        - For each valid start day, extracts an hourly sequence with the same temporal extent as the study period.
+        - Reindexes each sequence to the Study_period hours, enabling stacking and comparison.
+        
+    (2) it concatenates all sequences into a single dataframe df_sequences with a MultiIndex (id, weekstep_index).
+        id : user identifier 
+        weekstep_index : Integer number of weeks between the candidate start day and the study period start. 
+                         It identifies temporal shifts of a 28-day window across the Time_range. 
     '''
-    #feature unique values 
-    f_vals = df[f].unique()
-    #subset dataframe according to feature f records 
-    return {v: df[df[f]==v] for v in f_vals}
 
-def stack_dict_to_df(DICT_contacts, f_name = 'level'):
-    rows = []
-    for key, df in DICT_contacts.items():
-        df = df.copy()
-        df[f_name] = str(key)
-        rows.append(df)
-    stacked_df = pd.concat(rows, axis=0)#, ignore_index=True)
-    return stacked_df
+    print('collecting sequences')
+    
+    #[1] table of hourly record indicators (HRI)
+    traj_sample_hour = traj_sample[['user_id','datetime']].copy()
+    traj_sample_hour['datehour'] = pd.to_datetime(traj_sample_hour['datetime']).dt.floor('h')
+    traj_sample_hour = traj_sample_hour[['user_id','datehour']].drop_duplicates()
+    traj_sample_hour['values'] = 1
+    HRI = traj_sample_hour.pivot(index = 'user_id',
+                                 columns = 'datehour',
+                                 values = 'values')
 
-def convert_daterange_from_weekday(Date_range):
-    idx = 0
-    while idx < len(Date_range) and Date_range[idx].weekday() >= 5:  # Skip weekends
-        idx += 1
-    return Date_range[(idx):]
+    #[2] Select the HRI within the time-range
+    HRI = HRI.reindex(columns = pd.date_range(Time_range[0], Time_range[1],
+                                              freq = 'h',
+                                              inclusive = 'left'), fill_value=0)
 
-def ConvertCoordinate_4326(lat, lon):
+    if Time_range == Study_period:
+        #add weekstep_index column to ensure consistency in the dataframe generation pipeline
+        HRI['weekstep_index'] = 0
+        HRI = HRI.set_index('weekstep_index', append = True)
+        HRI = HRI.fillna(0)
+        return HRI
+    
+    #[3]search for temporal intervals which:
+    Time_range_days = pd.date_range(Time_range[0], Time_range[1]) 
+    Study_period_days = (Study_period[1] - Study_period[0]).days +1
+    
+    Time_range_days = [t for t in Time_range_days
+                       if ((t - Study_period[0]).days % 7 == 0)  #step of 7 days
+                       and (Time_range[1] -t).days > Study_period_days] #require same temporal extent of the study period 
+    
+    nweek_distances = [int((t-Study_period[0]).days/7) for t in Time_range_days] 
+    dict_weeksteps = dict(zip(Time_range_days, nweek_distances))
+    
+    df_sequences = []
+    
+    for daystart, weekstep_index in dict_weeksteps.items():
+        #print(daystart)
+    
+        #select the records within each time interval 
+        HRI_ti = HRI[pd.date_range(daystart, 
+                                   daystart + dt.timedelta(days = Study_period_days), 
+                                   freq = 'h', 
+                                   inclusive = 'left')].copy()
+    
+        #Assign for each time-interval the columns: sequence of hours within the study period 
+        #in order to stack all the datasets generated in the for loop
+        HRI_ti.columns = pd.date_range(Study_period[0], 
+                                       Study_period[0] + dt.timedelta(days = Study_period_days), 
+                                       freq = 'h', 
+                                       inclusive = 'left')
+        
+        #Assign a column 'weekstep_index' in order to identify each time-interval
+        HRI_ti['weekstep_index'] = weekstep_index
+        df_sequences.append(HRI_ti)
+    
+    df_sequences = pd.concat(df_sequences, axis = 0).fillna(0)
+    
+    df_sequences = df_sequences.reset_index().set_index(['user_id','weekstep_index'])
+    
+    return df_sequences
+
+
+##########################
+##### STOP DETECTION  ####
+##########################
+
+def convert_coordinate_4326(lat, lon):
     '''
-    function for conversion from crs:3857 to crs:4326
+    function for conversion from crs:3857 (meters) to crs:4326 (degrees)
     '''
     
     latInEPSG4326 = (180 / math.pi) * (2 * math.atan(math.exp(lat * math.pi / 20037508.34)) - (math.pi / 2))
@@ -140,33 +196,28 @@ def ConvertCoordinate_4326(lat, lon):
     
     return latInEPSG4326, lonInEPSG4326
 
-def convert_df_coord_4326(df_loc, lat = 'lat', lon = 'lon'):
+def convert_coordinate_3587(lat, lon):
     '''
-    convert df coordinate from crs:3857 to crs:4326    
-    '''
-    df_loc[[lat, lon]] = df_loc.apply(lambda row: ConvertCoordinate_4326(row[lat], row[lon]), axis=1, result_type='expand')
-
-def ConvertCoordinate_3587(lat, lon):
-    '''
-    conversion from crs:4326 to crs:3587
+    conversion from crs:4326 (degrees) to crs:3587 (meters)
     '''
     
     latInEPSG3857 = (math.log(math.tan((90 + lat) * math.pi / 360)) / (math.pi / 180)) * (20037508.34 / 180)
     lonInEPSG3857 = (lon* 20037508.34 / 180)
     
     return latInEPSG3857, lonInEPSG3857
+
+def convert_df_coord_4326(df_loc, lat = 'lat', lon = 'lon'):
+    '''
+    convert df coordinate from crs:3857 (meters) to crs:4326 (degrees)    
+    '''
+    df_loc[[lat, lon]] = df_loc.apply(lambda row: convert_coordinate_4326(row[lat], row[lon]), axis=1, result_type='expand')
+
     
 def convert_df_coord_3587(df_loc, lat= 'lat', lon = 'lon'): 
     '''
-    convert df coordinate from crs:4326 to crs:3587    
+    convert df coordinate from crs:4326 (degrees) to crs:3587 (meters)    
     '''
-    df_loc[[lat, lon]] = df_loc.apply(lambda row: ConvertCoordinate_3587(row[lat], row[lon]), axis=1, result_type='expand')
-
-
-
-##########################################
-######## STOP DETECTION FUNCTIONS ########
-##########################################
+    df_loc[[lat, lon]] = df_loc.apply(lambda row: convert_coordinate_3587(row[lat], row[lon]), axis=1, result_type='expand')
 
 def diameter(coords, metric='euclidean'):
     if len(coords)<2:
@@ -185,7 +236,7 @@ def medoid(coords, metric='euclidean'):
     sum_distances = np.sum(distances, axis=1)
     medoid_index = np.argmin(sum_distances)
     return coords[medoid_index, :]
-
+    
 def update_diameter(c_j, coords_prev, D_prev): 
     '''
     c_j: new point's coordinate
@@ -207,29 +258,37 @@ def update_diameter(c_j, coords_prev, D_prev):
     return D_i_jp1
 
 def lachesis(traj, 
-             dur_min, 
-             dt_max, 
-             delta_roam):
+             dur_min = 10, 
+             dt_max = 360, 
+             delta_roam = 50):
     """
-    Extract stays from raw location data.
-    Parameters
-    ----------
-    traj: numpy array - simulated trajectory from simulate_traj.
-        - (lat,lon) : 'y', 'x' in crs:3586
-        - time is 'unix_timestamp' in 'timestamp' format
+    INPUT : single individual GPS trajectory
+    > traj : df with columns ['user_id','datetime','lat','lon']
+        
     dur_min [minutes]   : float - minimum duration for a stay (stay duration).
     dt_max  [minutes]   : float - maximum duration permitted between consecutive pings in a stay. dt_max should be greater than dur_min 
     delta_roam [meters] : float - maximum roaming distance for a stay (roaming distance).
 
-    Returns
-    """
-    
-    coords = traj[['x', 'y']].to_numpy()
-    Stays = np.empty((0,6))
+    Return stays: stop table of the GPS trajectory
 
-    #[STEP0] starting the search
+    OUTPUT
+    stays: stop table
+    df with columns: ['start_time', 'end_time', 'medoid_x', 'medoid_y', 'diameter_m', 'n_pings', 'duration_s', 'geohash9']
+    """
+
+    #[STEP0] preprocess the trajectory
+    #unix timestamp in seconds
+    traj['unix_timestamp'] = pd.to_datetime(traj['datetime'], utc=True).astype('int64') // 10**9
+    #convert coordinates to CRS:3587 (meters)
+    convert_df_coord_3587(traj, lat = 'lat', lon = 'lon')
+    traj = traj.rename(columns = {'lat': 'y',
+                                  'lon': 'x'})
+
+    #input coordinates for the Lachesis algorithm
+    coords = traj[['x', 'y']].to_numpy()
+    #initialize the collection of stays
+    Stays = np.empty((0,6))
     i = 0
-    
     while i < len(traj)-1:
         
         #[STEP1] - find the least amount of pings over a timerange > dur_min
@@ -300,217 +359,10 @@ def lachesis(traj,
 
     return stays
 
-#########################################
-### COMPLETE USER SELECTION FUNCTIONS ###
-#########################################
 
-def gen_daterange(row, 
-                  dt_start = 'start_time', 
-                  dt_end   = 'end_time', 
-                  only_borders= False):
-        '''
-        gen daterange with hour frequency keeping same borders with higher temporal resolution
-        '''
-
-        if only_borders:
-            return pd.DatetimeIndex(row[[dt_start, dt_end]])    
-
-        #create the stops daterange with 1hour resolution
-        daterange = pd.date_range(start=row[dt_start], end=row[dt_end], freq='h')
-        if len(daterange) >2:
-            new_daterange = pd.DatetimeIndex([row[dt_start]]).append(daterange[1:-1]).append(pd.DatetimeIndex([row[dt_end]]))
-            return new_daterange
-        else:
-            return pd.DatetimeIndex(row[[dt_start, dt_end]])     
-
-
-def interpolate_loc_1hd(df_LOC, df_stops): 
-    '''
-    interpolate location dataset at 1hour downsample resolution with the stop dataset
-    '''
-    #1-hour downsampled location data
-    df_LOC_1hd = df_LOC[['id','unix_timestamp']].copy()
-    df_LOC_1hd['unix_timestamp'] = pd.to_datetime(df_LOC_1hd['unix_timestamp'], unit='s').dt.floor('h')
-    df_LOC_1hd = df_LOC_1hd.drop_duplicates()
-    df_LOC_1hd.rename(columns = {'unix_timestamp':'date_hour'}, inplace = True)
-    df_LOC_1hd['lach_inter'] = False 
-    
-    #lachesis stop exploded dataset 
-    df_se = df_stops.reset_index()[['id','level_1', 'start_time','end_time']]
-    df_se.loc[df_se.index,'date_hour'] = df_se.apply(lambda row: gen_daterange(row), axis=1)
-    df_se = df_se[['id','date_hour']].explode('date_hour')
-    df_se['date_hour'] = df_se['date_hour'].dt.floor('h')
-    df_se = df_se.drop_duplicates()
-    df_se['lach_inter'] = True
-    
-    #1hour downsampled interpolated dataset
-    df_LOC_1hd =  pd.concat([df_LOC_1hd, df_se], axis= 0).drop_duplicates(subset = ['id','date_hour'], 
-                                                                          keep = 'first')
-    return df_LOC_1hd
-
-
-def clip_midnight(df_brt_n):  
-    
-    # Ensure that the 'date_hour' column is in datetime format
-    df_brt_n.index = pd.to_datetime(df_brt_n.index)
-    
-    # Define the start and end of the desired period (from midnight to midnight)
-    start = df_brt_n[df_brt_n.index.time == pd.Timestamp('00:00:00').time()].index.min()
-    end = df_brt_n[df_brt_n.index.time == pd.Timestamp('23:00:00').time()].index.max()
-    
-    # Filter the DataFrame to include only rows from the first to the last midnight
-    df_clipped = df_brt_n.loc[start:end]
-
-    return df_clipped
-
-
-def sliding_window_hour_res(df_ts_bool_, 
-                            SW_width_days, 
-                            SW_step_days):
-    '''
-    df_ts_bool: table of boolean record presence
-    SW_width_days : width of the sliding window
-    SW_step_days  : step of the sliding window 
-    '''
-
-    #conversion to hours 
-    SW_width_hours = SW_width_days*24
-    SW_step_hours = SW_step_days*24
-
-    df_ts_bool = df_ts_bool_.copy()
-    df_ts_bool.index = range(len(df_ts_bool))
-    
-    #range of indexes for the sliding window
-    #step of 1day 
-    
-    Indexes = df_ts_bool.index[:-(SW_width_hours-1):(SW_step_hours)]
-    
-    df_window_counts = []
-    
-    for I_win in Indexes: 
-        
-        #counting number of records over the sliding window
-        window_counts = df_ts_bool.loc[I_win: I_win + SW_width_hours -1]#
-        window_counts = window_counts.sum(axis=0).values
-        df_window_counts.append(window_counts)
-
-    DT_index = df_ts_bool_.index[:-(SW_width_hours-1):(SW_step_hours)]
-    Users = df_ts_bool.columns 
-    
-    df_window_counts = pd.DataFrame(df_window_counts, index = DT_index, columns = Users)
-    
-    return df_window_counts
-    
-def sw_count(df_brt_n, W, S): 
-    
-    #clip to first and last midnight
-    df_v1 = clip_midnight(df_brt_n).copy()
-    #set index to date 
-    df_v1['date'] = df_v1.index.date
-    
-    Users = df_brt_n.columns
-    
-    date_counts = df_v1.groupby('date').size()
-    date_no24 = date_counts[date_counts!=24]
-    if len(date_no24)>0:
-        print('exception, some dates have less records than 24')
-    
-    #sliding window count
-    df_swc = sliding_window_hour_res(df_v1[Users], W, S)
-
-    return df_swc
-
-
-def sw_count_hour_records(df_lh, 
-                          SW_width_days, 
-                          SW_step_days = 1):
-    '''
-    df_lh : location-hour dataset (should be interpolated by lachesis)
-    SW_width_days : sliding window width 
-    SW_step_days  : sliding window step
-    plot_sw_count : if True, plots the time-series of sliding window counts 
-    tolerance : number of tolerated missing hours within the sliding window
-    '''
-
-    df_tbh = df_lh.pivot(index = 'date_hour', 
-                         columns = 'id', 
-                         values = 'lach_inter')
-    
-    df_rb = (~df_tbh.isna())*1
-    
-    N_tot_hours = SW_width_days*24
-    
-    #sliding window counting
-    df_swc = sw_count(df_rb, SW_width_days, SW_step_days)
-    
-    return df_swc
-    
-def plot_complete_users(ax, 
-                        df_swc, 
-                        Th_rec):
-    '''
-    df_swc : slinding window counting dataframe
-    Th_rec : threshold on number of records for considering the user complete
-    '''
-    #boolean over thresold
-    df_cot = df_swc >= Th_rec
-    N_us = df_cot.sum(axis=1)
-    X,Y = N_us.index, N_us.values
-    ax.plot(X,Y)
-
-#########################################
-###### SPARSE TRAJECTORY SAMPLING  ######
-#########################################
-
-def create_mask_single_user(U0, 
-                            Study_period, 
-                            df_DRSP, 
-                            path):
-    '''
-    U0 : user-id (str)
-    Study_period : datetime tuple, default is from 2014-2 to 2015-2
-    df_DRSP : temporal-intervals for sparse trajectory sampling
-    path : file-path storing the raw individual location data
-    
-    create hourly mask for a single user 
-    over consecutive intervals within the study-period
-    the intervals have the same length of the epidemiologic modeling date-range
-    the interval shift is by 1week
-    '''
-    
-    Cols_select = ['id','datetime']
-    df_U0 = pd.read_csv(os.path.join(path, f'{U0}.csv'), 
-                                     usecols=Cols_select, 
-                                     index_col=None, 
-                                     parse_dates=['datetime'], 
-                                     dtype = None)
-
-    #downsample the records to hour resolution and drop duplicates 
-    df_U0 = df_U0[df_U0.datetime.between(Study_period[0], Study_period[1])]
-    df_U0['datetime'] = df_U0['datetime'].dt.floor('h')
-    df_U0.drop_duplicates(inplace = True)
-
-    #merge with the Studyperiod ranges
-    df_U0_ext = pd.merge(df_DRSP, 
-                         df_U0, 
-                         on  = ['datetime'], 
-                         how = 'left')
-
-    #remove week-indexes with missing records 
-    valid_indices = df_U0_ext.groupby('weekstep_index')['id'].transform(lambda x: x.notna().any())
-    df_U0_ext = df_U0_ext[valid_indices]
-    if df_U0_ext.empty:
-        return 
-
-    df_U0_ext = df_U0_ext.pivot(index= 'weekstep_index', columns = 'datetime_dr', values = 'id')#.fillna(0)
-    df_U0_ext = 1*(~df_U0_ext.isna())
-    
-    return df_U0_ext
-
-
-########################################
-##### CONTACT ESTIMATION FUNCTIONS #####
-########################################
+###############################
+##### CONTACT ESTIMATION  #####
+###############################
 
 def filter_stops(df_stops, 
                  USERS_select, 
@@ -518,15 +370,14 @@ def filter_stops(df_stops,
                  Cols_select = None, 
                  reset_ghr = None):
     '''
-    filter stop-table after complete user selection
-    if reset_ghr : proccesses geohash column at the required resolution
+    filter stop-table within a desired Date_range   
     '''
     
     if Cols_select is None:
         Cols_select = df_stops.columns
         
     #user selection
-    df_stops_US = df_stops[Cols_select].loc[df_stops.id.isin(USERS_select)]
+    df_stops_US = df_stops[Cols_select].loc[df_stops.user_id.isin(USERS_select)]
     #daterange selection
     cs,ce = df_stops_US['start_time'] >= Date_range[0],  df_stops_US['end_time'] < Date_range[1] 
     df_stops_DR = df_stops_US[ cs & ce]
@@ -555,7 +406,7 @@ def filter_stops(df_stops,
 def get_stops_CONTACT(df_stops_DR, geohash = 'geohash'):
     '''
     df_stops_DR : exploded stop table 
-    returns simple stop table contributing to contacts
+    returns simple stop table potentially contributing to contacts
     '''
 
     #count the number of occurring stops for each hour and geohash
@@ -573,7 +424,6 @@ def get_stops_CONTACT(df_stops_DR, geohash = 'geohash'):
     
     return df_stops_CONTACT 
 
-#functions for contact estimation
 def interp_boolean(lst):
     '''
     given boolean series,
@@ -594,7 +444,6 @@ def interp_boolean(lst):
         
     return lst
 
-
 def estimate_contacts_hourly(df_gh, time_resolution = '1hour'):#, df_stop_borders= None):
     '''
     def compute_contact_table(df_stops, geohash_col = 'geohash'):
@@ -611,11 +460,11 @@ def estimate_contacts_hourly(df_gh, time_resolution = '1hour'):#, df_stop_border
     '''
 
     df_gh.loc[:,'set'] = df_gh.apply(lambda row: [row['start_time'], row['end_time']], axis=1)
-    df_ghe = df_gh[['id','set']].explode('set')
+    df_ghe = df_gh[['user_id','set']].explode('set')
     df_ghe['val']= 1
-    
+
     #create indicator table of stop border
-    df_th = df_ghe.pivot(index = 'set', columns = 'id', values = 'val')
+    df_th = df_ghe.pivot(index = 'set', columns = 'user_id', values = 'val')
     
     #reindex the table at the minute resolution
     index_1hd = pd.date_range(start = df_th.index.min().floor('h'), end = df_th.index.max().floor('h'), freq= 'min')
@@ -658,8 +507,6 @@ def compute_contact_table(df_stops, geohash_col = 'geohash', time_resolution = '
         
     return df_ch
 
-#marginal contact estimation
-
 def get_gh_pop_neighbour(df_gph0):
     '''
     groupby function at hour level 
@@ -671,20 +518,8 @@ def get_gh_pop_neighbour(df_gph0):
     df_gph0 = df_gph0.explode('gh_ns')
     df_gph0['pair_set'] = df_gph0.apply(lambda row: set([row['geohash'], row['gh_ns']]), axis=1)
     df_filtered = df_gph0[df_gph0.duplicated('pair_set', keep=False)]
-    
-    #[0] check correct function working
     df_filtered = df_filtered.drop(columns='pair_set')#[['geohash']]#.values
     df_filtered = df_filtered.reset_index(drop=True)['geohash'].unique()
-
-    #CHECK = (np.sort(df_h0_un['geohash'].unique()) == np.sort(df_h0_un['gh_ns'].unique())).all()
-
-    #[1] check correct function working (the neighbourhood pairs are always 2 for each hour)
-    #on a single hour dataframe
-    #Hours = df_SDR['stop_time'].unique()
-    #df_h0 = df_SDR[df_SDR['stop_time'] ==Hours[0]]
-    #df_h0_un = keep_gh_pop_neighbour(df_h0)
-    #df_h0_un['pair_set_str'] = df_h0_un['pair_set'].apply(lambda x: str(sorted(x)) )
-    #df_h0_un.sort_values(by = 'pair_set_str')
 
     return df_filtered
 
@@ -709,8 +544,6 @@ def get_stops_NEIGHBOURS(df_stops_DR):
     
     return df_stops_NEIGHBOURS
 
-
-#COMPUTE COLLECTION GEOHASH WIDTHS
 def get_gh_widths(df_gh_input): 
     '''
     compute the widths of a set of geohashes of dataframe df_gh_input
@@ -757,20 +590,79 @@ def join_original_geohashes(df_contacts_shift,
     given contact table add info on originary geohash of each id at 1minute resolution
     '''
 
-    Cols_select= ['id', 'stop_minute',geohash_col]
+    Cols_select= ['user_id', 'stop_minute',geohash_col]
 
-    for u in ['u1','u2']: 
+    for u in ['u1','u2']:
         df_contacts_shift = df_contacts_shift.merge(
             df_stops_NEIGHBOUR_1min[Cols_select],
             how='left',
             left_on=[u, 'date_time'],
-            right_on=['id', 'stop_minute']
-        ).rename(columns={geohash_col: f'{u}_geohash'}).drop(columns=['id', 'stop_minute'])
+            right_on=['user_id', 'stop_minute']
+        ).rename(columns={geohash_col: f'{u}_geohash'}).drop(columns=['user_id', 'stop_minute'])
     
     return df_contacts_shift 
 
+def compute_contact_marginal(df_stops_DR, 
+                             ghr, 
+                             time_resolution = '1minute'):
+    '''
+    compute marginal contacts from the stop table
+    '''
+    
+    df_ch_margin = []
+    #compute the widths of the collection of geohashes
+    df_gh_widths = get_gh_widths(df_stops_DR)
+    wx,wy = df_gh_widths.loc[0,'width_x'], df_gh_widths.loc[0,'width_y']
+    
+    #compute collection of stops which have populated neighbours
+    #for contact-contributing stop selection
+    df_stops_NEIGHBOUR = get_stops_NEIGHBOURS(df_stops_DR)
+    #collection of shift sequences
+    Shift_seq = [ (-1,0), (0,-1), (1,0)]
+    for Shift in Shift_seq:    
+        #perform medioid shift and new geohash assignation  
+        geohash_shift(df_stops_NEIGHBOUR, Shift, wx,wy, perc_width = 0.5, ghr = ghr, new_gh_col = 'geohash_shift')
+        #select stops contributing to contact after the shift 
+        df_stops_NEIGHBOUR_shift_CONTACT = get_stops_CONTACT(df_stops_NEIGHBOUR, 'geohash_shift')
+        #explode the contact stops at 1minute resolution for original geohash assignment and marginal stop selection
+        df_stops_NEIGHBOUR_1min = df_stops_NEIGHBOUR_shift_CONTACT.copy()
+        df_stops_NEIGHBOUR_1min['stop_minute'] = df_stops_NEIGHBOUR_1min.apply(lambda x : pd.date_range(start = x['start_time'], 
+                                                                                                      end = x['end_time'], 
+                                                                                                      freq='min'), axis=1)
+        
+        df_stops_NEIGHBOUR_1min = df_stops_NEIGHBOUR_1min.explode('stop_minute')
+        #compute contacts   
+        df_contacts_shift = compute_contact_table(df_stops_NEIGHBOUR_shift_CONTACT, 
+                                                  geohash_col = 'geohash_shift', 
+                                                  time_resolution = '1minute')
+        #compute original geohashes at 1 minute resolution
+        df_contacts_shift = join_original_geohashes(df_contacts_shift, 
+                                                    df_stops_NEIGHBOUR_1min, 
+                                                    geohash_col = 'geohash')
+        #filter out unchanged geohash couples
+        df_contacts_shift = df_contacts_shift[df_contacts_shift['u1_geohash'] != df_contacts_shift['u2_geohash']]
+        df_ch_margin.append(df_contacts_shift)
+
+    #Join all marginal contacts from the 3 shifts 
+    df_ch_margin = pd.concat(df_ch_margin, axis=0)
+    
+    #Dropping duplicated contacts over the shifts
+    df_ch_margin_unique = df_ch_margin.drop_duplicates(subset = ['date_time','u1','u2'], keep = 'first').copy()
+
+    if time_resolution == '1minute':
+        return df_ch_margin_unique
+
+    if time_resolution == '1hour':
+        df_ch_margin_unique['date_hour'] = df_ch_margin_unique['date_time'].dt.floor('h')
+        Cols_select = ['u1','u2','u1_geohash','u2_geohash','date_hour']
+        df_cmargin_hour = df_ch_margin_unique.groupby(Cols_select).size().reset_index()
+        df_cmargin_hour.rename(columns = {0:'n_minutes'}, inplace = True)
+        return df_cmargin_hour
+
 def compute_tot_contacts(df_cm,df_cw):
     '''
+    Joing the hourly within-cell and marginal contacts
+    
     df_cw : within-cell contacts
     df_cm : marginal contacts
     '''
@@ -778,265 +670,158 @@ def compute_tot_contacts(df_cm,df_cw):
     df_ctot = pd.concat([df_cm[Cs], df_cw[Cs]], axis=0)
     df_ctot = df_ctot.groupby(['u1','u2','date_hour'])['n_minutes'].sum().reset_index()
     
-    return df_ctot
+    return df_ctot    
 
-##############################################
-######### SPARSITY FUNCTIONS ###########
-##############################################
+def estimate_contacts(df_stops, 
+                      ghr = 8, 
+                      time_step = '1hour',
+                      Date_range = None,
+                      return_within_marginal = False):
+    '''
+    INPUT 
+    > df_stops dataframe
+    Consists of the stop tables for the sample of students in the DTU Campus data
+    Contains columns ['start_time', 'end_time', 'medoid_x', 'medoid_y', 'diameter_m', 'n_pings', 'duration_s', 'geohash8']  
 
-def get_user_sparse_stats(df_LOC_, 
-                          t  = 'timestamp', 
-                          id = 'id',
-                          Date_window=None): 
-    '''
-    compute sparse statistics
-    '''
+    > ghr: geohash resolution for contact estimation
+    > Date_range : selected date range for contact estimation
+        - For reasons of computational cost, it is suggested to use a Date_range of the order of 1 day.   
     
-    df_LOC = df_LOC_.copy()
-    if Date_window is not None: 
-        Date_window_utc = (
-            int(pd.Timestamp(Date_window[0]).timestamp()),
-            int(pd.Timestamp(Date_window[1]).timestamp()))
-        utc_start, utc_end = Date_window_utc
-        df_LOC = df_LOC[df_LOC[t].between(utc_start, utc_end, inclusive='left')]
+    OUTPUT 
+    > df_contacts
+    df with columns: ['u1', 'u2', 'date_hour', 'n_minutes']
+    Each record reports a contact duration between user 'u1' and 'u2' on hour 'date_hour' for 'n_minutes' minutes
+    
+    In our experiment we perform contact estimation for each day and save the contacts as a collection of daily csv files, 
+    we save separately within-cell and marginal contacts
+    '''
+
+    #[0] filter temporally the stop table within the desired Date_range
+    if Date_range is not None:
+        df_stops = filter_stops(df_stops,
+                                USERS_select = list(df_stops['user_id'].unique()),
+                                Date_range = Date_range)
+
+    if len(df_stops) == 0:
+        return pd.DataFrame(columns=['u1', 'u2', 'date_hour', 'n_minutes'])
+
+    #set the geohash resolution for contact estimation
+    df_stops = df_stops.rename(columns = {'geohash9': 'geohash'})
+    df_stops['geohash'] = df_stops['geohash'].str[:ghr]
+
+    #explode temporally the stop table
+    df_stops['unique_stop_id'] = range(len(df_stops))
+    df_stops['stop_hour'] = [list(pd.date_range(start=r.start_time.floor('h'),
+                                                end=r.end_time.floor('h'),
+                                                freq='h'))
+                             for r in df_stops.itertuples()]
+    df_stops = df_stops.explode('stop_hour').drop_duplicates(['geohash', 'stop_hour', 'unique_stop_id'])
+    
+    #select stops populated by more than 1 user
+    #potentially contributing to the contact estimation
+    df_stops_CONTACT = get_stops_CONTACT(df_stops) 
+
+    #WITHIN CELL CONTACTS (uses df_stops_CONTACT)
+    df_cwithin = compute_contact_table(df_stops_CONTACT, 
+                                       geohash_col = 'geohash', 
+                                       time_resolution = time_step)
+    
+    #MARGINAL CONTACTS (uses df_stops)
+    df_cmargin = compute_contact_marginal(df_stops, 
+                                          ghr, 
+                                          time_resolution = time_step)
+
+    if return_within_marginal:
+        return df_cwithin, df_cmargin
+
+    if time_step == '1minute':
+        _cols_select = ['date_time','u1','u2']
+        return pd.concat([df_cwithin[_cols_select], df_cmargin[_cols_select]], axis = 0)
+
+    if time_step == '1hour':
+        return compute_tot_contacts(df_cmargin, df_cwithin)    
+   
+def estimate_daily_contacts(df_stops, 
+                            Study_period, 
+                            ghr = 8,
+                            time_step = '1hour'):
+    '''
+    given a stop table; estimates daily contacts over a study period of interest
+    
+    df_stops : stop location table
+    Study_period: list with start and end day of study period for contact estimation
+    '''
+    #collect contacts for each day of a given study period
+    DICT_contacts = {}
+    for day in pd.date_range(Study_period[0], Study_period[1]):
+        df_contacts_day = estimate_contacts(df_stops,
+                                            ghr = 8, 
+                                            time_step = '1hour',
+                                            Date_range = [day, day + dt.timedelta(days=1)]) 
+        DICT_contacts[day] = df_contacts_day
         
-    df_uid_lifespan = df_LOC.groupby(id).apply(lambda x: x[[t]].describe())
-    df_uid_lifespan = df_uid_lifespan.reset_index()
-    Cols_select = ['min', 'max', 'count']
-    df_uid_lifespan = df_uid_lifespan.pivot(index=id, 
-                                            columns='level_1', 
-                                            values=t)[Cols_select]
-    
-    df_uid_lifespan.rename(columns={'count': 'n_records'}, inplace=True)
-    df_uid_lifespan['min'] = pd.to_datetime(df_uid_lifespan['min'], unit='s')
-    df_uid_lifespan['max'] = pd.to_datetime(df_uid_lifespan['max'], unit='s')
-    if Date_window is not None:
-        df_uid_lifespan['min'] = pd.to_datetime(Date_window[0])
-        df_uid_lifespan['max'] = pd.to_datetime(Date_window[1])
-    
-    df_uid_lifespan['lifespan_days'] = (df_uid_lifespan['max'] - df_uid_lifespan['min']).dt.days
-    df_uid_lifespan['lifespan_hours'] = df_uid_lifespan['lifespan_days'] * 24
-    
-    # record indicator dataframe
-    df_rid = df_LOC[[id, t]].copy()
-    df_rid['date_time'] = pd.to_datetime(df_rid[t], unit='s')
-    df_rid['date_hour'] = df_rid['date_time'].dt.floor('h')
-    unique_date_hours = df_rid.groupby(id)['date_hour'].nunique()
-    df_uid_lifespan = df_uid_lifespan.merge(
-        unique_date_hours.rename('n_hours'),
-        left_index=True,
-        right_index=True)
-    
-    N = df_uid_lifespan['n_hours']
-    N_tot = df_uid_lifespan['lifespan_hours']
-    df_uid_lifespan['perc_missing_hours'] = 100 * (N_tot - N) / N_tot
-    
-    return df_uid_lifespan
-
-def gen_sparsity_metric_ranges(): 
-    '''
-    Set of sparsity metrics and corresponding ranges 
-    employied for sparsity sequence sampling
-    '''
-    
-    #SPARSITY METRICS AND STUDIED RANGES
-    Metrics_ranges = {'perc-missing-hours' : [(0,0.1), (0.1,0.2), (0.2,0.3),(0.3,0.4), (0.4,0.5), (0.5,0.6)]}
-    
-    Ths = [2,3,6,10]
-    Metrics_ranges.update({f'n-gaps-ot{th}hours': [(1,2),(3,4),(5,6),(7,10)] for th in Ths})
-
-    #TODO 
-    #pmh_gaps_over_threshold
-    #pmh_gap_over_threhsold_in_nightime
-
-    return Metrics_ranges 
-
-def gen_gap_lims(Seq):
-    '''
-    create gap list from a sequence
-    '''
-    Ind_gaps = Seq.diff() == -1
-    Ind_gaps_end = Seq.diff() == 1
-    Date_start_gaps = list(Ind_gaps[Ind_gaps.values].index)  # Convert to list to allow insertions
-    Date_end_gaps = list(Ind_gaps_end[Ind_gaps_end.values].index)  # Same for end gaps           
-    if Seq.iloc[0] == 0:
-        Date_start_gaps = [Seq.index[0]] + Date_start_gaps
-    if Seq.iloc[-1] == 0:
-        Date_end_gaps.append(Seq.index[-1])    
-    return [ (ds,de) for ds,de in zip(Date_start_gaps, Date_end_gaps) ]
+    return DICT_contacts
 
 
-def compute_seq_sparsity(df_id_gaps, metric, N_hours, th = None):
+###################################################
+##### GROUND TRUTH EPIDEMIC MODELING OUTCOMES #####
+###################################################
+
+def get_complete_users(df): 
     '''
-    compute sparsity metric for each sequence 
-    input sequence resolution is 1-hour
+    df: sequence of hourly record indicators
     '''
-    if metric == 'perc-missing-hours':
-        #[m1] percentage of missing records 
-        S_missing_hours = df_id_gaps.groupby('sequence_index')['gap_duration_hours'].sum()
-        S_pmh = S_missing_hours/(N_hours)
+    #select complete users which have more than 95% of hours over the study period ([0-5]% missing hours)
+    df = df[df.index.get_level_values("weekstep_index") == 0]
+    df_users_complete = df[df.mean(axis=1) >= 0.95]
+    USERS_select = list(df_users_complete.index.get_level_values("id").unique())
+    return USERS_select
+
+#import the groundtruth contacts for epidemic modeling
+def get_groundtruth_contacts(df,
+                             FOLD_groundtruth_contacts, 
+                             Study_period):
+    '''
+    df: sequence of hourly record indicators
+    FOLD_contact: folder where the daily contacts are saved
+    Study_period: list with start and end day of study period 
+    '''
+
+    USERS_select = get_complete_users(df)
+    
+    #collection of days 
+    Date_range = pd.date_range(Study_period[0], Study_period[1])
+    
+    df_contacts = []
+    for D0 in Date_range:
         
-        return S_pmh
+        #select a specific date
+        D0 = str(D0.date())
         
-    if metric == 'n-gaps-ot':
-        #[m2] number of gaps >= threshold
-        invalid_row_indices = df_id_gaps[df_id_gaps['gap_duration_hours'] > 24]['sequence_index'].unique()
-        df_igs = df_id_gaps[~df_id_gaps['sequence_index'].isin(invalid_row_indices)]
-        df_igs_count = get_table_count(df_igs, 'sequence_index', 'gap_duration_hours')
-        df_ngaps_over_th = df_igs_count.iloc[:, ::-1].cumsum(axis=1).iloc[:, ::-1]
+        #import within and marginal contacts
+        df_D0_cw = pd.read_csv(f'{FOLD_groundtruth_contacts}df_cwithin_{D0}.csv')
+        df_D0_cm = pd.read_csv(f'{FOLD_groundtruth_contacts}df_cmargin_{D0}.csv')
         
-        return df_ngaps_over_th[th]
-
-
-def get_unselected_users(df_lh, USERS_select, Date_range):
-    '''
-    df_lh: LOC_1hdi 
-    get unselected users with gaps at the hour resolution before Lachesis interpolation
-    '''
-    
-    #BOOLEAN RECORD INDICATOR, AT ONE HOUR DOWNSAMPLED RESOLUTION
-    
-    #select only raw records
-    df_lh_raw = df_lh[~df_lh['lach_inter']]
-
-    #create raw table of boolean records
-    df_tbr = df_lh_raw.pivot(index = 'id', 
-                             columns = 'date_hour', 
-                             values = 'lach_inter') 
-    
-    df_tbr = (~df_tbr.isna())*1
-
-    #Unselected useres
-    df_tbr_UNS = df_tbr.loc[~df_tbr.index.isin(USERS_select)]
-
-    #filter over the date_range
-    cols_select = df_tbr_UNS.columns[(df_tbr_UNS.columns>=Date_range[0]) & (df_tbr_UNS.columns<Date_range[1])]
-    df_tud = df_tbr_UNS[cols_select]
-    
-    return df_tud
-
-def sparse_sample_weigthed(user_gaps_perc, N_select, P_level):
-    '''
-    user_gaps_perc : individual series of sparsity level 
-    impelement weighted sampling without replacement
-    '''
-    weights = 1 / (np.abs(user_gaps_perc - P_level) + 1e-6)
-    weights /= weights.sum()
-    
-    selected_indices = np.random.choice(user_gaps_perc.index, 
-                                        size=N_select, 
-                                        replace=False, 
-                                        p=weights)
-    
-    return selected_indices
-    
-
-def sparse_unif_sample(user_gaps_perc, 
-                       N_select, 
-                       P, 
-                       P_hw = 0.1):
-    '''
-    define a subsample of unselected users 
-    with sparsity belonging to the P centered interval with half width P_hw
-    extract N_select from this subsample with replacement
-    '''
-
-    U_phw_ind = user_gaps_perc.between(P-P_hw, P+P_hw)
-    U_phw = user_gaps_perc[U_phw_ind]
-    
-    selected_users = np.random.choice(U_phw.index, 
-                                      size=N_select, 
-                                      replace=True)
-    
-    return selected_users, len(U_phw)
-
-def gen_gap_overlay_mask(P, df_ugh, N_select, P_hw = 0.1):
-    
-    #percentage of missing temporal records over the study period for each user 
-    N_recs = df_ugh.shape[1]
-    user_gaps_perc = (N_recs - df_ugh.sum(axis=1))/N_recs
-    
-    selected_users, sample_dim = sparse_unif_sample(user_gaps_perc, N_select, P, P_hw = P_hw)
-    
-    #select mask for sparsity P selection
-    df_GP = df_ugh.loc[selected_users]
-    df_GP.index.name = None
-
-    return df_GP
-
-def unpivot_mask(df_mask, v_name = 'datetime'):
-    '''
-    unpivot the gap mask
-    useful for gap overlaying
-    '''
-    
-    df_mask_reset = df_mask.reset_index()
-    df_unpivoted = pd.melt(df_mask_reset, id_vars='index', var_name= v_name, value_name='value')
-    df_unpivoted = df_unpivoted.rename(columns={'index': 'id'})
-    df_unpivoted[v_name] = pd.to_datetime(df_unpivoted[v_name])
-    df_unpivoted = df_unpivoted.sort_values(by = ['id', v_name])
-    
-    return df_unpivoted
-
-def from_mask_to_record_indicator(df_mask, t_res = 'datetime'):
-    '''
-    converts a gap mask to a record indicator
-    useful for gap overlaying
-    '''
-    
-    df_mask_up = unpivot_mask(df_mask, v_name = t_res)
-    df_record_select = df_mask_up[df_mask_up['value']==1].drop('value', axis=1)
-    if t_res == 'date_hour':
-        #extend the date_hour resolution
-        f = lambda x : pd.date_range(x['date_hour'], x['date_hour'].replace(minute = 59), freq='min') 
-        df_record_select['datetime'] = df_record_select.apply(f, axis =1)
-        df_record_select = df_record_select[['id','datetime']].explode('datetime')
+        #join all contacts
+        df_D0_contacts = compute_tot_contacts(df_D0_cm, df_D0_cw)
+        c_u1 = df_D0_contacts['u1'].isin(USERS_select)
+        c_u2 = df_D0_contacts['u2'].isin(USERS_select)
+        df_D0_contacts = df_D0_contacts[c_u1 & c_u2]
+        df_contacts.append(df_D0_contacts)
         
-    return df_record_select
-
-
-#######################################
-######### EPIDEMIC MODELING ###########
-#######################################
-
-def convert_rate_from_second_to_minute(beta_sec, gamma_sec): 
-    #COMPOUNDED PROBABILITIES - 1 minute resolution 
-    beta_min = 1 - (1 - beta_sec)**60
-    gamma_min = 1 - (1 - gamma_sec)**60
-    pars = (beta_min, gamma_min) 
-    return pars
+    df_contacts = pd.concat(df_contacts, axis = 0)
     
-def gen_dict_epid_pars(): 
+    return df_contacts, USERS_select, Date_range
+
+def subset_df_feature(df,f):
     '''
-    parameters for 2 epidemic scenarios
-    from Colizza paper: 'Simulation of an SEIR infectious disease model 
-    on the dynamic contact network of conference attendees'
+    df : dataframe
+    f  : feature name 
     '''
-    
-    #SCENARIO1 - VERY SHORT incubation and infectious periods
-    #beta  : probability of being infected in 1-second
-    beta_sec = 3e-4            
-    #gamma : inverse of recovery period in seconds 
-    gamma_sec = 1/(24*3600)
-    
-    DICT_pars = {}
-    DICT_pars['very-short-epidemic'] = convert_rate_from_second_to_minute(beta_sec, gamma_sec)
-    #SCENARIO2 - SHORT incubation and infectious periods
-    DICT_pars['short-epidemic'] = convert_rate_from_second_to_minute(beta_sec/2, gamma_sec/2)
-
-    #rescaled epidemiological parameters
-    DICT_pars['recov4'] = convert_rate_from_second_to_minute(beta_sec/4, gamma_sec/4)
-    DICT_pars['recov8'] = convert_rate_from_second_to_minute(beta_sec/8, gamma_sec/8)
-    DICT_pars['recov16'] = convert_rate_from_second_to_minute(beta_sec/16, gamma_sec/16)
-
-    #selected (beta,gamma) after grid-search
-    Betas  = np.linspace(1e-5, DICT_pars['recov16'][0],5)
-    Gammas = np.linspace( DICT_pars['recov8'][1], DICT_pars['short-epidemic'][1] ,5)
-    inds_select = (3,2)
-    i,j = inds_select
-    DICT_pars['epid_grid_select_n1'] = ( Betas[i], Gammas[j])
-    
-    return DICT_pars
+    #feature unique values 
+    f_vals = df[f].unique()
+    #subset dataframe according to feature f records 
+    return {v: df[df[f]==v] for v in f_vals}
 
 def to_dense_sym(W_D0, USERS_select):
     '''
@@ -1051,7 +836,6 @@ def to_dense_sym(W_D0, USERS_select):
     
     return W_D0_sym
 
-
 def gen_contact_daily(df_contact_hour, 
                       USERS_select, 
                       clip_max_minutes = True):
@@ -1064,10 +848,11 @@ def gen_contact_daily(df_contact_hour,
 
     df_contact_daily = df_contact_daily.groupby(['u1', 'u2', 'date']).agg({
     'n_minutes': 'sum' }).reset_index()
-    #df_contact_daily = df_contact_daily.groupby(['u1','u2','date']).sum().reset_index()
+
     W = subset_df_feature(df_contact_daily, 'date')
     W = {D:to_dense_sym(W_D, USERS_select) for D, W_D in W.items()}
 
+    #clipping to maximum number of minutes in a day
     if clip_max_minutes:
         W = {k: c.clip(upper = 1440) for k,c in W.items()}
 
@@ -1122,6 +907,7 @@ def sample_transition(X, X_d, W_D0, pars, gamma_daily = False):
 def epid_simulation(W,
                     USERS_select,
                     pars, 
+                    Dates,
                     p = 0.1, 
                     n_init = None,
                     seed_number = None,
@@ -1140,98 +926,11 @@ def epid_simulation(W,
     ts_SI = []
     ts_SI.append(X.sum(axis=0))
     
-    Dates = np.sort(list(W.keys()))
     for D0 in Dates:
         sample_transition(X, X_d, W[D0], pars, gamma_daily = gamma_daily)
         ts_SI.append(X.sum(axis=0))
 
     return np.array(ts_SI)
-
-def iter_epid_simulation(W, 
-                         Date_range,
-                         USERS_select, 
-                         pars, 
-                         p_init = 0.05, 
-                         n_init = None,
-                         N_iter=100, 
-                         from_weekday = False, 
-                         gamma_daily = False):
-    '''
-    W: dictionary of contact data
-    pars : (beta, gamma) at minute resolution 
-    p_init : fraction of initial infected
-    '''
-
-    COLLECT_simulations = []
-    COLLECT_epid_metrics = []
-    
-    if from_weekday:
-        #remove the first dates if they belong to the weekend
-        W_dates = Date_range.date
-        #print(W_dates)
-        while W_dates[0].weekday() >= 5:  # 5 and 6 correspond to Saturday and Sunday
-            W_dates = W_dates[1:]
-        W = {w:W[w] for w in W_dates}
-
-    for i in range(N_iter):
-       
-        #compute the time-series of suscpetible-infected and R0
-        ts_SI_R0 = epid_simulation(W, 
-                                   USERS_select,
-                                   pars = pars, 
-                                   p = p_init, 
-                                   n_init = n_init,
-                                   seed_number = None, 
-                                   gamma_daily = gamma_daily)
-        
-        #compute the epidemiological metrics 
-        epid_metrics = compute_epid_metrics(ts_SI_R0)
-        
-        COLLECT_simulations.append(ts_SI_R0)    
-        COLLECT_epid_metrics.append(epid_metrics)
-
-    COLLECT_simulations = np.array(COLLECT_simulations)
-    COLLECT_epid_metrics = np.array(COLLECT_epid_metrics)
-
-    return COLLECT_simulations, COLLECT_epid_metrics
-
-def gen_epid_calibration_grid_dict():
-    '''
-    generate grid of parameters for epidemic calibration
-    '''
-    
-    DICT_epid_pars = gen_dict_epid_pars()
-    DICT_grid = {}
-    
-    Betas  = np.linspace(1e-5, 1e-2, 5)
-    Gammas = np.linspace(DICT_epid_pars['short-epidemic'][1], 
-                         DICT_epid_pars['recov16'][1], 5)
-    N_inits = [1,3,5,10]
-    DICT_grid['v0'] = epid_pars_grid = list(itertools.product(Betas, Gammas, N_inits))
-
-    #Generate the grid of parameters for the grid search
-    Betas  = np.linspace(1e-4, 1e-1, 10)
-    Gammas = np.linspace(DICT_epid_pars['short-epidemic'][1], 
-                         DICT_epid_pars['recov16'][1], 5)
-    N_inits = [1,3,5,10]
-    DICT_grid['v1'] = epid_pars_grid = list(itertools.product(Betas, Gammas, N_inits))
-
-    #Generate the grid of parameters for the grid search
-    Betas  = np.linspace(1e-4, 1e-3, 10)
-    Gammas = np.linspace(DICT_epid_pars['very-short-epidemic'][1], 
-                         DICT_epid_pars['recov16'][1], 10)
-    N_inits = [1,2,3,4,5,6,10]
-    DICT_grid['v2'] =  list(itertools.product(Betas, Gammas, N_inits))
-
-    #Generate the grid of parameters for the grid search
-    Betas  = np.linspace(.5e-4, 1e-2, 20)
-    Gammas = np.linspace(DICT_epid_pars['very-short-epidemic'][1], 
-                         DICT_epid_pars['recov8'][1], 10)
-    N_inits = [1,3,5,10]#,15,20,30,50]
-    DICT_grid['v3'] = list(itertools.product(Betas, Gammas, N_inits))
-    
-    return DICT_grid
-    
     
 def compute_epid_metrics(ts_SI):
     '''
@@ -1284,14 +983,853 @@ def compute_epid_stats(COLLECT_epid_metrics):
 
     return df_epid_stats
 
+def iter_epid_simulation(W, 
+                         Date_range,
+                         USERS_select, 
+                         pars, 
+                         p_init = 0.05, 
+                         n_init = None,
+                         N_iter=100, 
+                         gamma_daily = False):
+    '''
+    W: dictionary of contact data
+    pars : (beta, gamma) at minute resolution 
+    p_init : fraction of initial infected
+    '''
 
-def compute_SI_stats(COLLECT_simulations):
+    COLLECT_simulations = []
+    COLLECT_epid_metrics = []
     
-    q25, q50, q75 = np.percentile(COLLECT_simulations, [25, 50, 75], axis=0)
-    Q_columns = ['S_perc25', 'I_perc25', 'S_median', 'I_median', 'S_perc75', 'I_perc75' ]
-    df_SI_stats = pd.DataFrame(np.column_stack([q25,q50,q75]), columns = Q_columns)
+    for i in range(N_iter):
+       
+        #compute the time-series of suscpetible-infected and R0
+        ts_SI_R0 = epid_simulation(W, 
+                                   USERS_select,
+                                   pars = pars, 
+                                   p = p_init, 
+                                   n_init = n_init,
+                                   Dates = Date_range,
+                                   seed_number = None, 
+                                   gamma_daily = gamma_daily)
+        
+        #compute the epidemiological metrics 
+        epid_metrics = compute_epid_metrics(ts_SI_R0)
+        
+        COLLECT_simulations.append(ts_SI_R0)    
+        COLLECT_epid_metrics.append(epid_metrics)
+
+    COLLECT_simulations = np.array(COLLECT_simulations)
+    COLLECT_epid_metrics = np.array(COLLECT_epid_metrics)
+
+    return COLLECT_simulations, COLLECT_epid_metrics
+
+def epidemic_modeling(df_contacts, 
+                      USERS_select, 
+                      dict_epid_pars,
+                      Date_range,
+                      N_iter):
+    '''
+    INPUT
+    df_contacts  : df with columns ['u1', 'u2', 'date_hour', 'n_minutes']
+    USERS_select : list of unique users in the contact dataframe
+    dict_epid_pars : dict with values:
+        - beta : probability of infection given 1-minute contact
+        - gamma : probability of recovery over 1 day
+        - seed size : number of initial infected of the SIR model
+    Date_range : ordered list of consecutive days of the simulation
+    N_iter: number of iterations of the epidemic simulation 
+
+    OUTPUT
+    [1] epid_curves 
+        array of shape (N_iter, #simulation days, 2)
+            epid_curves[i] has as columns the count of Susceptibles and Infected
+            
+    [2] epid_metrics (computed metrics from epid curves)
+        array of shape (N_iter, 5)
+    '''
+
+    #convert the contacts as an ordered list of daily contact matrices
+    W = gen_contact_daily(df_contacts, USERS_select)
     
-    return df_SI_stats
+    #[1] Launch the epidemic simulation
+    epid_pars = (dict_epid_pars['beta'], dict_epid_pars['gamma'])
+    n_init = dict_epid_pars['n_init']
+    
+    #[1.2] Collect the simulation outcomes
+    #epid_curves : daily time-series of Susceptible and Infected 
+    #epid_metrics: associated epidemic metrics computed from epid_curves
+    epid_curves, epid_metrics = iter_epid_simulation(W, 
+                                                     Date_range,
+                                                     USERS_select, 
+                                                     epid_pars, 
+                                                     n_init = n_init, 
+                                                     N_iter = N_iter,
+                                                     gamma_daily = True)
+    
+    return epid_curves, epid_metrics
+
+############################################################
+##### SPARSIFICATION AND ESTIMATION OF BIASED CONTACTS #####
+############################################################
+
+def gen_gap_lims(Seq):
+    '''
+    create gap list from a sequence
+    '''
+    Ind_gaps = Seq.diff() == -1
+    Ind_gaps_end = Seq.diff() == 1
+    Date_start_gaps = list(Ind_gaps[Ind_gaps.values].index)  # Convert to list to allow insertions
+    Date_end_gaps = list(Ind_gaps_end[Ind_gaps_end.values].index)  # Same for end gaps           
+    if Seq.iloc[0] == 0:
+        Date_start_gaps = [Seq.index[0]] + Date_start_gaps
+    if Seq.iloc[-1] == 0:
+        Date_end_gaps.append(Seq.index[-1])    
+    return [ (ds,de) for ds,de in zip(Date_start_gaps, Date_end_gaps) ]
+
+def gen_gaps_df(df_gaps):
+    '''
+    generate gap dataframe with information on starting hour and duration 
+    df_gaps : input matrix of record indicators
+    '''
+    
+    #gap dataframe indicator
+    df_gh = df_gaps.copy()
+    df_gh.columns = pd.to_datetime(df_gh.columns)
+
+    #adding a last column (1hours exceeding the time-range) to account for border gaps
+    last_col = df_gh.columns[-1]
+    last_col_plus1 = last_col + dt.timedelta(hours=1)
+    df_gh[last_col_plus1] = 1 
+
+    #generating the list of gaps for each sequence
+    df_gh['gaps'] = df_gh.apply(gen_gap_lims, axis=1)
+    df_gh['sequence_index'] = df_gaps.index
+    df_gh = df_gh[df_gh['gaps'].apply(len) > 0]
+    df_id_gaps = df_gh[['sequence_index', 'gaps']].explode(['gaps'])
+    df_id_gaps['start'] = df_id_gaps['gaps'].apply(lambda x : x[0])
+    df_id_gaps['gap_duration_hours'] =  df_id_gaps['gaps'].apply(lambda A : (A[1]-A[0]).total_seconds()/3600)
+    df_id_gaps = df_id_gaps[df_id_gaps['gap_duration_hours'] != 0]
+    df_id_gaps['start_hour'] = df_id_gaps['start'].dt.hour 
+    
+    return df_id_gaps.set_index('sequence_index')
+
+def filter_sequences(df_seq_ss):
+    '''
+    remove sequences which have a gap greater than 1 week (24*7 hours)
+    
+    '''
+    df_gap_ss = gen_gaps_df(df_seq_ss)
+    
+    df_gap_ss_max = df_gap_ss.groupby(level = 'sequence_index').agg({'gap_duration_hours':'max'}) 
+    
+    df_gap_ss_overmax = df_gap_ss_max[df_gap_ss_max['gap_duration_hours'] > 24*7]
+    
+    df_seq_ss = df_seq_ss[~df_seq_ss.index.isin(df_gap_ss_overmax.index)]
+
+    return df_seq_ss
+
+def compute_entropy(df_gaps): 
+    '''
+    entropy computation over a dataframe of gaps
+    df_gaps: datasets containing the duration of each gap for each sequence in the dataframe
+    '''
+    from scipy.stats import entropy
+
+    col = 'gap_duration_hours'
+    m_vals = df_gaps[col].values
+    bins = np.arange(1, np.max(m_vals)+1)
+    freqs = np.histogram(m_vals,bins)[0]/len(m_vals)
+    return entropy(freqs)
+
+def gen_mask(level, 
+             df_seq,
+             df_seq_complete):
+    '''    
+    level: sparsity level
+    df_seq : dataframe of hourly record indicators (employed for sparsification of the complete trajectories)
+        index has to be the id of the sequence 
+    df_seq_complete: dataframe of hourly record indicators of the complete users
+        index has to be the id of the user
+        
+    Generate mask for sparsification of the complete user trajectories within a sparsity level 
+    '''
+
+    #ensure that there are no duplicated indexes for the sample of all sequences
+    df_seq.index = range(len(df_seq))
+    
+    #compute the sparsity (fraction of missing hours) for each sequence
+    seq_sparsity = (1- df_seq.mean(axis=1)).sort_values()
+    seq_complete_sparsity = (1- df_seq_complete.mean(axis=1)).sort_values()
+
+    #reorder the sequences based on the sparsity levels
+    df_seq = df_seq.loc[seq_sparsity.index]
+    df_seq_complete = df_seq_complete.loc[seq_complete_sparsity.index]
+    
+    #bucket the complete users based on intervals of length .01 
+    buckets, buckets_count = np.unique(np.floor(seq_complete_sparsity.values*100)/100 + 0.01, 
+                                            return_counts=True)
+    #iterative sampling conditioned on the sparsity level of the complete trajectories
+    lev_mask = []
+    for v,c in zip(buckets, buckets_count):
+
+        #this condition ensures that the selected sparse trajectories
+        v_indexes = seq_sparsity[seq_sparsity.between(level[0], level[1] - v)].index
+        
+        #the sampling of trajectories in df_seq is conditional on the sparsity of the complete users
+        #such that the each sampled sparse sequence -- when added to the complete trajctory -- 
+        #results in a sparsified trajectory which falls within the desired sparsity level
+        v_indexes_sampled = np.random.choice(v_indexes, size = c, replace = True)
+        v_gaps_sampled = df_seq.loc[v_indexes_sampled]
+        lev_mask.append(v_gaps_sampled)
+        
+    lev_mask = pd.concat(lev_mask, axis=0)
+    
+    #re-indexing corresponding to the id of the complete users
+    #in order to have correct association when implementing the sparsification
+    lev_mask.index = df_seq_complete.index
+    
+    return lev_mask
+
+#shuffle the gaps keeping the length
+def shuffle_gaps_keep_durations(row):
+    '''
+    shuffle gaps in a sequence keeping their durations
+    '''
+    
+    # Step 1: Count runs of 0s and 1s
+    counts = [(k, sum(1 for _ in g)) for k, g in itertools.groupby(row)]
+    
+    # Step 2: Split into even and odd index blocks
+    c_even = counts[::2]
+    c_odds = counts[1::2]
+    
+    # Step 3: Shuffle both lists
+    np.random.shuffle(c_even)
+    np.random.shuffle(c_odds)
+
+    # Step 4: Randomize start
+    if np.random.rand() < 0.5:
+        first, second = c_even, c_odds
+    else:
+        first, second = c_odds, c_even
+
+    # Step 5: Alternate elements
+    count_shuffled = []
+    min_len = min(len(first), len(second))
+    for i in range(min_len):
+        count_shuffled.append(first[i])
+        count_shuffled.append(second[i])
+    
+    if len(first) > len(second):
+        count_shuffled.extend(first[min_len:])
+    elif len(second) > len(first):
+        count_shuffled.extend(second[min_len:])
+
+    # Step 6: Expand to full row
+    row_shuffled = [val for val, count in count_shuffled for _ in range(count)]
+    
+    return row_shuffled
+
+def get_complete_users(df_seq):
+    '''
+    df_seq : dataframe of hourly record indicators (employed for selection of the complete trajectories)
+    return the list of complete users
+    '''
+    df_seq_w0 = df_seq[df_seq.index.get_level_values("weekstep_index") == 0]
+    df_seq_complete = df_seq_w0[df_seq_w0.mean(axis=1) >= 0.95]
+    USERS_complete = list(df_seq_complete.index.get_level_values('user_id'))
+    return USERS_complete 
+    
+def gen_sparsification_masks(_df_seq,
+                             Levels):
+    '''
+    df_seq : dataframe of hourly record indicators (employed for sparsification)
+    Levels : list of sparsity levels
+
+    create a collection of sparsification masks
+    for each sparsity level
+    for sparsification approacches: ['Data_driven', 'Random_shuffling', Random_uniform']   
+    '''
+    
+    #dataframe of hourly record indicators (employed for sparsification of the complete trajectories)
+    df_seq= _df_seq.copy()
+    
+    #remove sequences which have gaps larger than 1week
+    df_seq = filter_sequences(df_seq)
+    
+    #[2] select the complete users
+    df_seq_w0 = df_seq[df_seq.index.get_level_values("weekstep_index") == 0]
+    #dataframe of hourly record indicators of the complete users
+    df_seq_complete = df_seq_w0[df_seq_w0.mean(axis=1) >= 0.95]
+    df_seq = df_seq.droplevel('weekstep_index')
+    df_seq_complete = df_seq_complete.droplevel('weekstep_index')
+    
+    #Data-driven sparsification masks
+    DICT_mask = {level: gen_mask(level, 
+                                 df_seq, 
+                                 df_seq_complete) for level in Levels}
+
+    #Random baseline : shuffling gaps keeping durations
+    DICT_mask_random_shuffling = {l : m.apply(lambda row: pd.Series(shuffle_gaps_keep_durations(row.values), index=row.index), axis=1)
+                                        for l,m in DICT_mask.items()}
+
+    #Random baseline: shuffling record indicators -- record missing uniformly at random
+    DICT_mask_random_uniform =  {l : m.apply(lambda row: pd.Series(np.random.permutation(row.values), index=row.index), axis=1)
+                                        for l,m in DICT_mask.items()}
+
+    DICT_masks = {'Data_driven'     :      DICT_mask,
+                  'Random_shuffling': DICT_mask_random_shuffling, 
+                  'Random_uniform'  : DICT_mask_random_uniform}
+
+    return DICT_masks
+
+def unpivot_mask(df_mask):
+    '''
+    unpivot the gap mask for sparsification 
+    '''
+
+    v_name = 'date_hour'
+    df_mask_reset = df_mask.reset_index()
+    df_unpivoted = pd.melt(df_mask_reset, id_vars='user_id', var_name= v_name, value_name='value')
+    df_unpivoted[v_name] = pd.to_datetime(df_unpivoted[v_name])
+    df_unpivoted = df_unpivoted.sort_values(by = ['user_id', v_name])
+    
+    return df_unpivoted
+
+def from_mask_to_record_indicator(df_mask, t_res = 'minute'):
+    '''
+    converts a gap mask to a record indicator
+    '''
+    
+    df_mask_up = unpivot_mask(df_mask.copy())
+    df_record_select = df_mask_up[df_mask_up['value'] == 1].drop('value', axis=1)
+    
+    if t_res == 'minute':
+        #explode the dataset at the minute resolution in order to match the trajectory records
+        f = lambda x : pd.date_range(x['date_hour'], x['date_hour'].replace(minute = 59), freq='min') 
+        df_record_select['datetime'] = df_record_select.apply(f, axis =1)
+        df_record_select = df_record_select[['user_id','datetime']].explode('datetime')
+        
+    return df_record_select
+
+def sparsification_pipeline(traj_complete,
+                            DICT_masks,
+                            sparsity_approach,
+                            level,
+                            FOLD_iter=None,
+                            file_prefix=None):
+    '''
+    INPUT traj_complete dataframe
+        Consists of the complete GPS location trajectories (0-5% missing hours) during the study period 2014-2-10 to 2014-3-7
+        it contains columns ['user_id', 'datetime', 'lat', 'lon']
+        traj_complete : complete GPS trajectories
+        DICT_masks : nested dict containing the sparsficiation masks
+            (see section 6.1 Creation of the hourly record indicator mask for sparsification)
+        sparsity_approach : can take values ['Data_driven', 'Random_shuffling', 'Random_uniform']
+        level : range of missing hours from config.Levels
+        FOLD_iter : optional output folder (iteration root). If provided, saves mask,
+            traj_complete_sparsified, df_stops and df_contacts to
+            FOLD_iter/<sparsity_approach>/<level>/
+
+    OUTPUT DICT_daily_contacts dict of type (dt.datetime, df_contact)
+        for each day it assigns the dataframe of hourly contacts on that day
+        dataframe contains columns ['u1', 'u2', 'date_hour', 'n_minutes']
+    '''
+
+    #[1] SPARSIFICATION
+    #selection of the mask
+    mask = DICT_masks[sparsity_approach][level]
+    #unpivoting the mask for peforming sparsification
+    df_record_select = from_mask_to_record_indicator(mask,t_res = 'minute')
+    #adding the gaps of the mask into the complete trajectory
+    traj_complete_sparsified = pd.merge(df_record_select,
+                                        traj_complete,
+                                        on = ['user_id', 'datetime'],
+                                        how = 'left').dropna(subset=['lat', 'lon'])
+
+    #[2] STOP DETECTION
+    #lachesis parameters
+    dur_min    = 10
+    dt_max     = 360
+    delta_roam = 50
+    #run stop ddetection for each id trajectory
+    df_stops = traj_complete_sparsified.groupby('user_id').apply(lambda x: lachesis(x, dur_min, dt_max, delta_roam))
+    if isinstance(df_stops.index, pd.MultiIndex):
+        df_stops = df_stops.reset_index(level=1, drop=True).reset_index()
+    else:
+        df_stops = pd.DataFrame(columns=['user_id', 'start_time', 'end_time',
+                                         'medoid_x', 'medoid_y', 'diameter_m',
+                                         'n_pings', 'duration_s', 'geohash9'])
+
+    #[3] CONTACT ESTIMATION
+    #estimate daily contacts for each day in the study period
+    #contact records have hour resolution and report the number of minutes in contact
+    DICT_daily_contacts = estimate_daily_contacts(df_stops,
+                                                  config.Study_period,
+                                                  ghr = 8,
+                                                  time_step = '1hour')
+
+    #[4] OPTIONAL SAVE
+    if FOLD_iter is not None:
+        if file_prefix is not None:
+            prefix = f'{FOLD_iter}{file_prefix}_'
+            mask.to_csv(f'{prefix}mask.csv')
+            traj_complete_sparsified.to_csv(f'{prefix}traj_complete_sparsified.csv', index=False)
+            df_stops.to_csv(f'{prefix}df_stops.csv', index=False)
+            df_contacts = pd.concat(DICT_daily_contacts.values(), axis=0)
+            df_contacts.to_csv(f'{prefix}df_contacts.csv', index=False)
+        else:
+            FOLD_level = f'{FOLD_iter}{sparsity_approach}/{level}/'
+            mask.to_csv(f'{FOLD_level}mask.csv')
+            traj_complete_sparsified.to_csv(f'{FOLD_level}traj_complete_sparsified.csv', index=False)
+            df_stops.to_csv(f'{FOLD_level}df_stops.csv', index=False)
+            df_contacts = pd.concat(DICT_daily_contacts.values(), axis=0)
+            df_contacts.to_csv(f'{FOLD_level}df_contacts.csv', index=False)
+
+
+###################################################
+##### CONTACT CORRECTION – WEIGHT COMPUTATION #####
+###################################################
+
+#compute hourofday-weekperiod for a datetime series
+def gen_hw_col(v):
+    '''
+    gen hourofday_weekday column
+    '''
+    v = pd.to_datetime(v)
+    #index of weekday days (from Monday to Friday)
+    _wdays = [0,1,2,3,4,5]
+    _wperiod = np.array(['weekend','weekday'])
+    return [f"{t}_{_wperiod[w*1]}" for t,w in zip(v.hour, v.weekday.isin(_wdays))] 
+
+def compute_coef_aligned(R_k):
+    '''
+    compute globally aligned coefficients
+    '''
+    return pd.DataFrame(np.dot(R_k.T,R_k)/len(R_k), 
+                        index = R_k.columns, 
+                        columns = R_k.columns)
+
+def compute_coef_aligned_timebucket(R_k, h):
+    '''
+    compute aligned coefficients on different temporal buckets
+    '''
+    R_k_h = R_k.copy()
+    if h == 'hourofday_weekday':
+        R_k_h[h] = gen_hw_col(R_k.index.values)
+    if h == 'date':
+        R_k_h[h] = R_k.index.date
+    return R_k_h.groupby(h).apply(lambda df : compute_coef_aligned(df))
+
+def compute_contact_correction_weights(df_contacts_biased,
+                                       df_hri_sparsified):
+    '''
+    INPUTS 
+    [1] df_contacts_biased dataframe 
+    Cotains columns: ['u1', 'u2', 'date_hour', 'n_minutes']
+    Each record documents a contact between user 'u1' and 'u2' during hour 'date_hour' for 'n_minutes' minutes
+    
+    [2] df_hri_sparsified dataframe
+    hourly record indicator of the complete sparsified trajectories employied for computing df_contacts_biased
+    has as columns the sequence of hours in the study period
+    has index 'id'
+    
+    OUTPUT
+    > df_contacts_biased with new columns:   
+        hourofday_weekday : string indicating the hourofday (from 0 to 23) and the weekperiod (weekday or weekend)
+        coverage_u1 : coverage of user 'u1' during the specific hourofday_weekday over the study period
+        coverage_u2 : coverage of user 'u2' during the specific hourofday_weekday over the study period
+        weight : 1/(coverage_u1*coverage_u2)  
+    > coefs : coefficients  
+    '''
+    
+    #compute the individual-level coverage matrix for each time bucket
+    #the diagonal elements of this matrix contain the individual coverage level 
+    #for each specific time bucket (hourofday_weekday)
+    coefs = compute_coef_aligned_timebucket(df_hri_sparsified.T, 
+                                            'hourofday_weekday')
+    
+    
+    #assign each user to the coverage coefficients bucketed by hourofday weekday
+    df_contacts_biased['hourofday_weekday'] = gen_hw_col(df_contacts_biased['date_hour'].values)
+    df_contacts_biased['coverage_u1']  = df_contacts_biased.apply(lambda row: coefs.loc[row['hourofday_weekday']].loc[row['u1'], row['u1']], axis = 1) 
+    df_contacts_biased['coverage_u2']  = df_contacts_biased.apply(lambda row: coefs.loc[row['hourofday_weekday']].loc[row['u2'], row['u2']], axis = 1) 
+    
+    #compute the weight according to the IPW formula: 1/(p_i*p_j)
+    #where p_i is the probability of observing one record on the given time-bucket for user i 
+    df_contacts_biased['weight'] = 1/(df_contacts_biased['coverage_u1']*df_contacts_biased['coverage_u2'])
+
+    return df_contacts_biased, coefs
+    
+
+#################################
+##### CALIBRATION MODELING  #####
+#################################
+
+def compute_objective_function(params, 
+                               df_contacts, 
+                               USERS_select,
+                               Date_range, 
+                               N_iter,
+                               Curve_ref):
+    '''
+    params : (beta, gamma, seedsize) parameters of the SIR model
+    df_contacts : dataframe of contacts [u1,u2, datetime, n_minutes]
+    USERS_select : list of users id in the contact dataframe
+    Date_range : (dt.datetime.date) array of consecutive days for running the epidemic simulation 
+    N_iter : number of iteration of the epidemic simulation
+
+    Curve_ref : reference curve for calibration 
+        computed as the median of infected over the ensemble of groundtruth curves
+
+    return the RMSE between Curve_ref and the median of the simulations using df_contacts and params
+    '''
+    
+    beta, gamma, seedsize = params
+
+    #convert the contacts as an ordered list of daily contact matrices
+    W = gen_contact_daily(df_contacts, USERS_select)
+
+    #launch the epidemic simulations N_iter times
+    Sims, _ = iter_epid_simulation(W, 
+                                   Date_range,
+                                   USERS_select, 
+                                   pars = (beta, gamma), 
+                                   n_init = seedsize,
+                                   N_iter = N_iter)
+   
+    #compute the Median of infected over the ensemble of simulations
+    Median_infected = np.median(Sims[:,:,1], axis = 0) 
+
+    #compute the score as the RMSE between the reference curve (Curve_ref) and 
+    RMSE = np.sqrt(np.mean((Curve_ref - Median_infected)**2))
+
+    return RMSE
+
+class Objective_param_search:
+    
+
+    def __init__(self, 
+                 df_contacts, 
+                 USERS_select,
+                 Date_range, 
+                 N_iter,
+                 Curve_ref,
+                 GRID_stats):
+        '''
+        df_contacts : dataframe of contacts [u1,u2, datetime, n_minutes]
+        USERS_select : list of users id in the contact dataframe
+        Date_range : (dt.datetime.date) array of consecutive days for running the epidemic simulation 
+        N_iter : number of iteration of the epidemic simulation
+        Curve_ref : reference curve for calibration 
+            computed as the median of infected over the ensemble of groundtruth curves
+        GRID_stats : parameter boundaries 
+            dataframe with columns (beta, gamma, n_init) and rows (min, max)
+        '''
+        
+        self.df_contacts  = df_contacts
+        self.USERS_select = USERS_select
+        self.Date_range   = Date_range
+        self.N_iter       = N_iter
+        self.Curve_ref    = Curve_ref
+        self.GRID_stats   = GRID_stats
+
+    def __call__(self, trial):
+
+        GRID_stats = self.GRID_stats
+        beta = trial.suggest_float("beta", GRID_stats.loc["min", "beta"], GRID_stats.loc["max", "beta"])
+        gamma = trial.suggest_float("gamma", GRID_stats.loc["min", "gamma"], GRID_stats.loc["max", "gamma"])
+        seedsize = trial.suggest_int("seedsize", int(GRID_stats.loc["min", "seedsize"]), int(GRID_stats.loc["max", "seedsize"]))
+        
+        params = (beta, gamma, seedsize) 
+        
+        Objective_param_search = compute_objective_function(params, 
+                                                            self.df_contacts, 
+                                                            self.USERS_select,
+                                                            self.Date_range,
+                                                            self.N_iter,
+                                                            self.Curve_ref)
+        
+        return Objective_param_search
+
+def optuna_param_search(df_contacts_biased, 
+                        USERS_select,
+                        Date_range, 
+                        N_iter,
+                        Curve_ref,
+                        GRID_stats, 
+                        n_trials,
+                        show_progress_bar = True):
+    '''
+    INPUTS 
+    df_contacts : dataframe of contacts [u1, u2, datetime, n_minutes]\
+        Each record reports a contact between user 'u1' and 'u2' during hour 'date_hour' for 'n_minutes' minutes
+    USERS_select : list of users id in the contact dataframe
+    Date_range : (dt.datetime.date) array of consecutive days for running the epidemic simulation 
+    N_iter : number of iteration of the epidemic simulation
+
+    Curve_ref : reference curve for calibration 
+        computed as the median of infected over the ensemble of groundtruth curves
+        
+    GRID_stats : parameter boundaries 
+        dataframe with columns (beta, gamma, n_init) and rows (min, max)
+        
+    n_trials : number of trials of the optimization algorithm 
+
+    returns 
+    > best_params: dict with keys 'beta', 'gamma', 'seedsize'
+        optimal parameters generated by the calibration algorithm
+    > best_value: score of the parameter search
+    '''
+
+    #minimize the RMSE
+    study = optuna.create_study(direction="minimize") 
+        
+    Obj = Objective_param_search(df_contacts_biased, 
+                                 USERS_select,
+                                 Date_range, 
+                                 N_iter,
+                                 Curve_ref,
+                                 GRID_stats)
+
+    study.optimize(Obj, 
+                   n_trials = n_trials, 
+                   show_progress_bar = show_progress_bar) 
+    
+    return study.best_params, study.best_value
+
+def epid_modeling(df_contacts,
+                  USERS_select,
+                  Date_range,
+                  N_iter,
+                  groundtruth_params,
+                  modeling_type,
+                  Curve_ref=None,
+                  GRID_stats=None,
+                  n_trials=None,
+                  show_progress_bar=True):
+    '''
+    Epidemic modeling function for Oracle and Calibration workflows.
+
+    df_contacts       : dataframe of contacts [u1, u2, date_hour, n_minutes]
+    USERS_select      : list of user ids
+    Date_range        : (datetime.date) array of consecutive days for the simulation
+    N_iter            : number of iterations of the epidemic simulation
+    groundtruth_params: dict with keys 'beta', 'gamma', 'seedsize'
+    modeling_type     : 'Oracle' or 'Calibration'
+
+    Oracle-only args  : (ignored when modeling_type == 'Calibration')
+        (none beyond the common ones)
+
+    Calibration-only args:
+    Curve_ref         : reference infected curve (median of groundtruth ensemble)
+    GRID_stats        : parameter boundaries — DataFrame with columns (beta, gamma, n_init)
+                        and rows (min, max)
+    n_trials          : number of Optuna optimization trials
+    show_progress_bar : whether to display the Optuna progress bar
+
+    Returns
+    -------
+    Oracle      : epid_curves, epid_metrics
+    Calibration : epid_curves, epid_metrics, best_params, best_values
+    '''
+
+    if modeling_type == 'Oracle':
+        W = gen_contact_daily(df_contacts, USERS_select)
+        epid_curves, epid_metrics = iter_epid_simulation(
+            W,
+            Date_range,
+            USERS_select,
+            (groundtruth_params['beta'], groundtruth_params['gamma']),
+            n_init=groundtruth_params['seedsize'],
+            N_iter=N_iter,
+            gamma_daily=True)
+        return epid_curves, epid_metrics
+
+    elif modeling_type == 'Calibration':
+        best_params, best_values = optuna_param_search(
+            df_contacts,
+            USERS_select,
+            Date_range,
+            N_iter,
+            Curve_ref,
+            GRID_stats,
+            n_trials,
+            show_progress_bar=show_progress_bar)
+
+        W = gen_contact_daily(df_contacts, USERS_select)
+        epid_curves, epid_metrics = iter_epid_simulation(
+            W,
+            Date_range,
+            USERS_select,
+            (best_params['beta'], best_params['gamma']),
+            n_init=best_params['seedsize'],
+            N_iter=N_iter,
+            gamma_daily=True)
+        return epid_curves, epid_metrics, best_params, best_values
+
+    else:
+        raise ValueError(f"modeling_type must be 'Oracle' or 'Calibration', got '{modeling_type}'")
+
+
+###################
+##### OTHERS  #####
+###################
+
+def read_folder_files(folder_path,
+                      f_name=None,
+                      Cols_select=None,
+                      FILES_select=None,
+                      parse_dates_list=None,
+                      index_col=None,
+                      dtype = None,
+                      Date_range = None,
+                      n_workers = 1,
+                      chunksize = 2000):
+    '''
+    Read a collection of CSV files and returns a single dataframe
+
+    folder_path : path of the folder collecting the CSV dataframes
+    f_name : adds a new column indicating the name of each CSV file
+    Cols_select: list of selected columns for each csv
+    FILES_select : list of files to read (if None reads all files in the folder)
+    parse_dates_list : list of dates in the csv columns to be processed as datetimes
+    Date_range : filters the dataset based on the datetime columns
+    n_workers : number of threads for parallel reading (default: 1 = sequential)
+    chunksize : rows per chunk when Date_range filtering is active (default: 2000)
+    '''
+    FILES = os.listdir(folder_path)
+    if FILES_select is not None:
+        FILES = FILES_select
+    FILES = [f for f in FILES if f.endswith('.csv')]
+
+    n_files = len(FILES)
+    print(f'  reading {n_files} files (n_workers={n_workers})...')
+    completed = [0]
+
+    def _read_one(file_name):
+        if Date_range is not None:
+            chunks = pd.read_csv(os.path.join(folder_path, file_name),
+                                 usecols=Cols_select,
+                                 index_col=index_col,
+                                 parse_dates=parse_dates_list,
+                                 dtype=dtype,
+                                 chunksize=chunksize)
+            df = pd.concat(
+                chunk[pd.to_datetime(chunk.datetime, utc=True).dt.tz_convert(None).between(Date_range[0], Date_range[-1], inclusive='left')]
+                for chunk in chunks
+            )
+        else:
+            df = pd.read_csv(os.path.join(folder_path, file_name),
+                             usecols=Cols_select,
+                             index_col=index_col,
+                             parse_dates=parse_dates_list,
+                             dtype=dtype)
+        if f_name is not None:
+            df[f_name] = file_name.split('.csv')[0]
+        completed[0] += 1
+        print(f'  [{completed[0]}/{n_files}] {file_name} ({len(df)} rows)', flush=True)
+        return df
+
+    if n_workers > 1:
+        from multiprocessing.pool import ThreadPool
+        with ThreadPool(n_workers) as pool:
+            frames = pool.map(_read_one, FILES)
+    else:
+        frames = [_read_one(f) for f in FILES]
+
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+def get_table_count(df, x, y):
+    return df.groupby([x,y]).size().reset_index().pivot(index = x, columns = y, values = 0).fillna(0)
+
+def subset_df_feature(df,f):
+    '''
+    df : dataframe
+    f  : feature name 
+    '''
+    #feature unique values 
+    f_vals = df[f].unique()
+    #subset dataframe according to feature f records 
+    return {v: df[df[f]==v] for v in f_vals}
+
+def sort_df_columns(df, ascending = False):
+    '''
+    reorder a dataframe columns by the sum over the row-dimension
+    ''' 
+    Cols_ordered = df.sum(axis=0).sort_values(ascending = ascending).index
+    return df[Cols_ordered]
+
+def sort_df_rows(df, ascending = False):
+    # Calculate the average of each row (excluding the index or non-numeric columns)
+    row_sums = df.sum(axis=1)
+    # Sort the DataFrame rows based on the row averages
+    df_sorted = df.loc[row_sums.sort_values(ascending = ascending).index]
+    return df_sorted
+
+def stack_dict_to_df(DICT_contacts, f_name = 'level'):
+    rows = []
+    for key, df in DICT_contacts.items():
+        df = df.copy()
+        df[f_name] = str(key)
+        rows.append(df)
+    stacked_df = pd.concat(rows, axis=0)#, ignore_index=True)
+    return stacked_df
+
+def convert_daterange_from_weekday(Date_range):
+    idx = 0
+    while idx < len(Date_range) and Date_range[idx].weekday() >= 5:  # Skip weekends
+        idx += 1
+    return Date_range[(idx):]
+
+##############
+#LATEX TABLES#
+##############
+
+def _sanitize_str(x: str) -> str:
+    x = x.replace("±", r"$\pm$")
+    x = x.replace(" ± ", r" $\pm$ ")
+    x = x.replace("%", r"\%")
+    return x
+
+def _sanitize_labels(labels, names=None):
+    """Sanitize a (Multi)Index's labels and names."""
+    if isinstance(labels, pd.MultiIndex):
+        new_tuples = []
+        for tpl in labels.tolist():
+            new_tuples.append(tuple(_sanitize_str(str(v)) for v in tpl))
+        new_names = [(_sanitize_str(str(n)) if n is not None else None) for n in labels.names]
+        return pd.MultiIndex.from_tuples(new_tuples, names=new_names)
+    else:
+        new_vals = [_sanitize_str(str(v)) for v in labels.tolist()]
+        new_name = _sanitize_str(str(labels.name)) if labels.name else None
+        return pd.Index(new_vals, name=new_name)
+
+def _sanitize_df(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    # remove None/NaN -> ""
+    df = df.replace({None: ""})
+    df = df.replace({np.nan: ""})
+    # sanitize cell strings
+    df = df.map(lambda v: _sanitize_str(v) if isinstance(v, str) else v)
+    # sanitize columns and index (labels + names)
+    df.columns = _sanitize_labels(df.columns)
+    df.index   = _sanitize_labels(df.index)
+    return df
+
+def to_tabular(df: pd.DataFrame, column_format: str) -> str:
+    df = _sanitize_df(df)
+    # escape=False because we’ve already escaped/sanitized
+    return df.to_latex(escape=False,
+                       multicolumn=True,
+                       multicolumn_format='c',
+                       column_format=column_format,
+                       index = True)
+
+
+#####################################
+### COMPUTING REPRODUCTIVE NUMBER ###
+#####################################
 
 
 def compute_R0_daily(df_CD_level, 
@@ -1364,1847 +1902,10 @@ def compute_avg_R0(Contacts, epid_pars, Dates_select, gamma_daily = False):
     return R0_global_mean
 
 
-
-
-#############################################
-########## EXPERIMENTAL PIPELINE ############
-#############################################
-
-def get_complete_user_drange(df_fn,
-                             SW_width_days, 
-                             par_lach,
-                             ghr = 8,
-                             t_step = '1hour'): 
-
-    #get selected users
-    Cols_info = ['id','sparse', 'weekstep_index']
-    df_info = df_fn[Cols_info]
-    #get selected epidemic time-period
-    USERS_select = df_info[~df_info['sparse']]['id'].unique()
-    Date_start = pd.to_datetime(df_fn.columns[3])
-    Date_end = Date_start + dt.timedelta(days = SW_width_days-1)
-    Date_range = pd.date_range(Date_start, Date_end)
-
-    return USERS_select, Date_range
-
-def get_complete_contacts(df_fn,
-                          SW_width_days, 
-                          par_lach,
-                          ghr = 8,
-                          t_step = '1hour',
-                          FOLD_save = None):
-    '''
-    df_fn: sequence-dataset after complete user search
-    '''
-    
-    USERS_select, Date_range = get_complete_user_drange(df_fn,
-                                                        SW_width_days, 
-                                                        par_lach,
-                                                        ghr = 8,
-                                                        t_step = '1hour')
-
-    if FOLD_save is None:
-        mintime, maxdtime, maxdiam = par_lach
-        FOLD_contact = f'LACH_mintime_{mintime}_maxdtime_{maxdtime}_maxdiam_{maxdiam}_ghr{ghr}_tstep_{t_step}/'
-        FOLD_save = DICT_paths['TMP'] + 'f_008_D1_All_Contacts/' + FOLD_contact
-    
-    df_contacts = []
-    for D0 in Date_range:
-        #select a specific date
-        D0 = str(D0.date())
-        #import within and marginal contacts
-        df_D0_cw = pd.read_csv(f'{FOLD_save}df_cwithin_{D0}.csv')
-        df_D0_cm = pd.read_csv(f'{FOLD_save}df_cmargin_{D0}.csv')
-        ###############################################join all contacts
-        df_D0_contacts = compute_tot_contacts(df_D0_cm, df_D0_cw)
-        c_u1 = df_D0_contacts['u1'].isin(USERS_select)
-        c_u2 = df_D0_contacts['u2'].isin(USERS_select)
-        df_D0_contacts = df_D0_contacts[c_u1 & c_u2]
-        df_contacts.append(df_D0_contacts)
-        
-    df_contacts = pd.concat(df_contacts, axis = 0)
-    
-    return df_contacts, USERS_select, Date_range
-
-def get_complete_sequences(df_fn, USERS_select):
-    #select the study period
-    c_w0 = df_fn['weekstep_index']==0
-    c_sparse  = df_fn['sparse']
-    df_select = df_fn.loc[c_w0 & ~c_sparse]
-    df_select = df_select.drop(['sparse', 'weekstep_index'], axis = 1).set_index('id')
-    df_select.loc[USERS_select]
-    return df_select
-
-def compute_sparse_metric(df_sparse_seq, 
-                          metric,
-                          SW_width_days):
-    '''
-    df_sparse_seq : collection of sparse sequences
-    '''
-    
-    #generate the gap dataframe from the sparse sequences
-    df_gaps = gen_gaps_df(df_sparse_seq)
-
-    #SPARSITY METRICS AND STUDIED RANGES
-    Seq_series = compute_seq_sparsity(df_gaps, 
-                                      metric, 
-                                      N_hours = SW_width_days*24).sort_values()
-
-    N_recs = df_sparse_seq.sum(axis=1) 
-    N_tot_hours = len(df_sparse_seq.columns)
-    Inds_complete = N_recs[N_recs == N_tot_hours].index
-    Seq_complete = pd.Series(np.zeros(len(Inds_complete)), index = Inds_complete) 
-    Seq_series = Seq_series.add(Seq_complete, fill_value = 0)
-    
-    return Seq_series.sort_values()
-
-def gen_mask(level, 
-             Seq_series,
-             df_seq,
-             df_seq_complete, 
-             metric, 
-             SW_width_days):
-    '''
-    level: sparsity level
-    Seq_series: sparsity-series of sequence sample
-    df_seq : sequence sample
-    df_seq_complete: complete sequence undergoing sparsification
-    metric: employed sparsity metric
-    SW_width_days : slidng window period
-
-    Generate mask conditionally on sparsity of the (1-epsilon) complete user
-    '''
-
-    #reorder the eps-complete users based on their sparsity
-    Seq_sparsity_complete = compute_sparse_metric(df_seq_complete, 
-                                                  metric, 
-                                                  SW_width_days)
-
-    #compute the sparsity-level of the eps-complete users
-    sco_vals_2d = np.floor(Seq_sparsity_complete.values*100)/100 + 0.01
-    #count by grouping by 2-digits
-    sco_vals_2d, sco_vals_count = np.unique(sco_vals_2d, return_counts=True)
-    
-    lev_mask = []
-    
-    #iterative sampling conditioned on the eps-complete sparsity level
-    for v,c in zip(sco_vals_2d, sco_vals_count):
-        
-        v_indexes = Seq_series[Seq_series.between(level[0], level[1] - v)].index
-        
-        v_indexes_sampled = np.random.choice(v_indexes, size = c, replace = True)
-        
-        v_gaps_sampled = df_seq.iloc[v_indexes_sampled]
-        
-        lev_mask.append(v_gaps_sampled)
-        
-    lev_mask = pd.concat(lev_mask, axis=0)
-    lev_mask.index = Seq_sparsity_complete.index
-    
-    return lev_mask
-
-def detect_stops(df_LOC, par_lach): 
-    '''
-    df_LOC: raw location data
-    par_lach : parameter of the lachesis algorithm
-    '''
-    
-    dur_min, dt_max, delta_roam = par_lach
-    df_LOC = df_LOC.rename(columns = {'lng':'lon'})
-    df_LOC['datetime'] = pd.to_datetime(df_LOC['datetime']).astype('int64') // 10**9
-    time, lat, lon = 'datetime', 'lat','lon'
-    
-    c_dict = {time: 'unix_timestamp', lat: 'y', lon: 'x'}
-    df_LOC = df_LOC[['id',time,lat,lon]].rename(columns = c_dict)
-    convert_df_coord_3587(df_LOC, lat = 'y', lon = 'x')
-
-    df_stops = df_LOC.groupby('id').apply(lambda x: lachesis(x, dur_min, dt_max, delta_roam))
-    df_stops = df_stops.reset_index().drop('level_1',axis=1)
-    
-    return df_stops
-
-
-def estimate_contacts(df_stops_DR, 
-                      ghr, 
-                      time_step = '1hour'):
-    '''
-    df_stops_DR : simple stop location table
-    ghr: geohash resolution for contact estimation
-    time_resolution: can be '1hour' or '1minute'
-        
-    Performs within and marginal contact estimation
-    Returns : df_cwithin_hour, df_cmargin_hour
-    '''
-
-    #set the geohash resolution for contact estimation
-    df_stops_DR = df_stops_DR.rename(columns = {'geohash9': 'geohash'})
-    df_stops_DR['geohash'] = df_stops_DR['geohash'].str[:ghr]
-    #unique stop-indicator (univoque association of a stop to a user)
-    df_stops_DR['unique_stop_id'] = range(len(df_stops_DR))
-    df_stops_DR['stop_hour'] = df_stops_DR.apply(lambda x : pd.date_range(start = x['start_time'].floor('h'), 
-                                                                          end = x['end_time'].floor('h'), 
-                                                                          freq='h'), axis=1)
-    
-    df_stops_DR = df_stops_DR.explode('stop_hour').drop_duplicates(['geohash', 'stop_hour', 'unique_stop_id'])
-    
-    #SIMPLE STOP TABLE OF CELLS CONTRIBUTING TO CONTACTS
-    df_stops_CONTACT = get_stops_CONTACT(df_stops_DR) 
-
-    #[OUTPUT1] - WITHIN CELL CONTACTS (defaut is 1hour resolution with number of minutes in contacts)
-    df_cwithin = compute_contact_table(df_stops_CONTACT, 
-                                       geohash_col = 'geohash', 
-                                       time_resolution = time_step)
-    
-    #[OUTPUT2] - MARGINAL CONTACT ESTIMATION
-    df_ch_margin = []
-    #compute the widths of the collection of geohashes
-    df_gh_widths = get_gh_widths(df_stops_DR)
-    wx,wy = df_gh_widths.loc[0,'width_x'], df_gh_widths.loc[0,'width_y']
-    #compute collection of stops which have populated neighbours
-    #for contact-contributing stop selection
-    df_stops_NEIGHBOUR = get_stops_NEIGHBOURS(df_stops_DR)
-    #collection of shift sequences
-    Shift_seq = [ (-1,0), (0,-1), (1,0)]
-    for Shift in Shift_seq:    
-        #print(f'\t Shift {Shift}')
-        #perform medioid shift and new geohash assignation  
-        geohash_shift(df_stops_NEIGHBOUR, Shift, wx,wy, perc_width = 0.5, ghr = ghr, new_gh_col = 'geohash_shift')
-        #select stops contributing to contact after the shift 
-        df_stops_NEIGHBOUR_shift_CONTACT = get_stops_CONTACT(df_stops_NEIGHBOUR, 'geohash_shift')
-        #explode the contact stops at 1minute resolution for original geohash assignment and marginal stop selection
-        df_stops_NEIGHBOUR_1min = df_stops_NEIGHBOUR_shift_CONTACT.copy()
-        df_stops_NEIGHBOUR_1min['stop_minute'] = df_stops_NEIGHBOUR_1min.apply(lambda x : pd.date_range(start = x['start_time'], 
-                                                                                                      end = x['end_time'], 
-                                                                                                      freq='min'), axis=1)
-        
-        df_stops_NEIGHBOUR_1min = df_stops_NEIGHBOUR_1min.explode('stop_minute')
-        #compute contacts   
-        df_contacts_shift = compute_contact_table(df_stops_NEIGHBOUR_shift_CONTACT, 
-                                                  geohash_col = 'geohash_shift', 
-                                                  time_resolution = '1minute')
-        #compute original geohashes at 1 minute resolution
-        df_contacts_shift = join_original_geohashes(df_contacts_shift, 
-                                                    df_stops_NEIGHBOUR_1min, 
-                                                    geohash_col = 'geohash')
-        #filter out unchanged geohash couples
-        df_contacts_shift = df_contacts_shift[df_contacts_shift['u1_geohash'] != df_contacts_shift['u2_geohash']]
-        df_ch_margin.append(df_contacts_shift)
-
-    #Join all marginal contacts from the 3 shifts 
-    df_ch_margin = pd.concat(df_ch_margin, axis=0)
-    #Dropping duplicated contacts over the shifts
-    df_ch_margin_unique = df_ch_margin.drop_duplicates(subset = ['date_time','u1','u2'], keep = 'first').copy()
-    
-    if time_step == '1minute':
-        return df_cwithin, df_ch_margin_unique
-        
-    df_ch_margin_unique['date_hour'] = df_ch_margin_unique['date_time'].dt.floor('h')
-    Cols_select = ['u1','u2','u1_geohash','u2_geohash','date_hour']
-    df_cmargin_hour = df_ch_margin_unique.groupby(Cols_select).size().reset_index()
-    df_cmargin_hour.rename(columns = {0:'n_minutes'}, inplace = True)
-
-    return df_cwithin, df_cmargin_hour
-
-################################################
-########## RESULTS ANALYSIS FUNCTIONS ##########
-################################################
-
-def gen_sparsity_ranges():
-    '''
-    generate sparsity ranges
-    '''
-    
-    Metrics_ranges = {'perc-missing-hours' : [(0.1, 0.2), 
-                                              (0.2, 0.3), 
-                                              (0.3, 0.4),
-                                              (0.4, 0.5),
-                                              (0.5, 0.6)]}
-    
-    metric = 'perc-missing-hours'
-    Levels = Metrics_ranges[metric]
-    
-    return Levels
-
-def gen_gapseq_filenames(FOLD_SAVE,
-                         LIST_days, 
-                         LIST_epsilon,
-                         tol_stops, 
-                         startday01 = False):
-
-    DICT_tol_hours = {(e,w): int(24*e*w) for e in LIST_epsilon for w in LIST_days}
-    DICT_filenames = {(e,w): f'df_gapseq_epidwindowdays_{w}_epsilon_{e}_hourstol_{DICT_tol_hours[(e,w)]}' 
-                      for e in LIST_epsilon for w in LIST_days}  
-    if startday01:
-        DICT_filenames = {p:f'{n}_startday01' for p,n in DICT_filenames.items()}
-
-    if tol_stops: 
-        DICT_filenames = {p:f'{n}_withtolstops' for p,n in DICT_filenames.items()}
-        
-    return DICT_filenames
-
-def import_complete_contacts_users_drange():
-    '''
-    under complete scenario
-    returns contact dataframe, list of selected users and date range of epidemic simulation
-    '''
-
-    #import gap sequences for the overall sample
-    FOLD_seq = DICT_paths['TMP'] + 'f01_009_D1_gap_sequence_sample/'
-    LIST_days    = [14, 21, 28]
-    LIST_epsilon = [0, 0.05, 0.1]
-    tol_stops = False
-    DICT_filenames = gen_gapseq_filenames(FOLD_seq,
-                                          LIST_days, 
-                                          LIST_epsilon,
-                                          tol_stops)
-    
-    #parameters for lachesis stop-detection
-    par_lach = (10,360,50)
-    #epidemic-window search parameters
-    #days of the window
-    SW_width_days = 28
-    #tolerance on percentage of missing hours 
-    epsilon = 0.05
-    fn = DICT_filenames[(epsilon, SW_width_days)]
-    df_seq = pd.read_csv(f'{FOLD_seq}{fn}.csv')
-    #[1] get contacts of complete trajectories 
-    df_contacts, USERS_select, Date_range = get_complete_contacts(df_seq,
-                                                                  SW_width_days,
-                                                                  par_lach,
-                                                                  ghr = 8,
-                                                                  t_step = '1hour')
-    return df_contacts, USERS_select, Date_range
-
-def import_gap_seq(): 
-    '''
-    import default collection of gap sequences 
-    '''
-    
-    #epidemic-window search parameters - days of the window
-    SW_width_days = 28
-    #tolerance on percentage of missing hours 
-    epsilon = 0.05
-    
-    #[0.1] import gap sequences sample
-    FOLD_seq = DICT_paths['TMP'] + 'f01_009_D1_gap_sequence_sample/'
-    LIST_days    = [14, 21, 28]
-    LIST_epsilon = [0, 0.05, 0.1]
-    tol_stops = False
-    
-    DICT_filenames = gen_gapseq_filenames(FOLD_seq,
-                                          LIST_days, 
-                                          LIST_epsilon,
-                                          tol_stops)
-    
-    fn = DICT_filenames[(epsilon, SW_width_days)]
-    df_seq = pd.read_csv(f'{FOLD_seq}{fn}.csv')
-    
-    return df_seq
-
-def import_sparse_contacts(s,l,N_si):
-    '''
-    Import sparse contacts 
-    under the new iterated sparsification scenario
-    
-    N_sparse_iter : sparsification iteration realization
-    level: sparsification level
-    ss: sparsification scenario
-    '''
-    
-    FOLD_sparse = DICT_paths['TMP'] + 'f01_013_D1_iter_sparsified_mask_loc_stops_contacts/'
-    FOLD_save = f'{FOLD_sparse}Iter_sparse_{N_si}/{s}/{l}/'
-    df_cmargin_hour = pd.read_csv(FOLD_save + 'df_contact_marginal.csv')
-    df_cwithin_hour = pd.read_csv(FOLD_save + 'df_contact_within.csv')
-    df_contacts_level = compute_tot_contacts(df_cmargin_hour, df_cwithin_hour)
-    
-    return df_contacts_level
-
-def import_contacts_complete(return_contact_dataframe = False):
-    
-    df_contacts, USERS_select, Date_range = import_complete_contacts_users_drange() 
-    if return_contact_dataframe: 
-        return df_contacts
-    W_complete = gen_contact_daily(df_contacts, USERS_select)
-    
-    return W_complete  
-
-def import_contacts_complete_sparse(List_ss, 
-                                    Levels, 
-                                    Ranges_iter, 
-                                    import_complete = True): 
-    
-    df_contacts, USERS_select, Date_range = import_complete_contacts_users_drange() 
-
-    DICT_contacts = {}
-    DICT_contacts['Complete'] = import_contacts_complete()
-    DICT_contacts= {(s, l, N_si): gen_contact_daily(import_sparse_contacts(s,l,N_si), USERS_select) 
-                          for s in List_ss 
-                          for l in Levels 
-                          for N_si in Ranges_iter}
-    if import_complete:
-        DICT_contacts.update({'Complete': import_contacts_complete()})
-    
-    return DICT_contacts
-    
-def import_sparse_mask(s,l,N_si):
-    '''
-    Import sparse mask
-    under the new iterated sparsification scenario
-    
-    N_sparse_iter : sparsification iteration realization
-    level: sparsification level
-    ss: sparsification scenario
-    '''
-    
-    FOLD_sparse = DICT_paths['TMP'] + 'f01_013_D1_iter_sparsified_mask_loc_stops_contacts/'
-    FOLD_save = f'{FOLD_sparse}Iter_sparse_{N_si}/{s}/{l}/'
-    df_mask = pd.read_csv(f'{FOLD_save}df_mask.csv', index_col = 0)
-    
-    return df_mask
-
-
-def gen_complete_epid_groundtruth(scenario = 'epid_grid_select_n1'): 
-    
-    DICT_epid_pars = gen_dict_epid_pars()
-    epid_pars = DICT_epid_pars[scenario]
-    n_init = 3
-    N_iter = 100
-    
-    return epid_pars, n_init, N_iter
-    
-
-def import_str_complete_epid_groundtruth_str():
-    '''
-    returns string representation of epidemic modeling groundtruth parameters
-    '''
-    scenario = 'epid_grid_select_n1'
-    epid_pars, n_init, N_iter = gen_complete_epid_groundtruth(scenario)
-    _beta   = np.round(epid_pars[0]*100, 3)
-    _gamma  = np.round(epid_pars[1]*100, 3)
-    str_epid = scenario
-    str_epid += f'_beta_{_beta}_gamma_{_gamma}_ninit_{n_init}_Niter_{N_iter}' 
-    
-    return str_epid
-
-#import sparse stops dataset
-def import_sparse_stops(s,l,N_si):
-    '''
-    s : sparsity mechanism
-    l : sparsity level
-    N_si : number of sparsification iterations
-    '''
-    FOLD_sparse = DICT_paths['TMP'] + 'f01_013_D1_iter_sparsified_mask_loc_stops_contacts/'
-    FOLD_iter = f'{FOLD_sparse}Iter_sparse_{N_si}/'
-    FOLD_iter_ss = f'{FOLD_iter}{s}/'
-    FOLD_iter_ss_l = f'{FOLD_iter_ss}{l}/'
-    df_stops = pd.read_csv(FOLD_iter_ss_l + 'df_stops.csv', index_col = 0, parse_dates = ['start_time', 'end_time'])
-    
-    return df_stops
-
-def import_stops_complete_sparse(List_ss, 
-                                 Levels, 
-                                 Ranges_iter, 
-                                 Date_range, 
-                                 USERS_select):
-
-    #import sparse stops
-    DICT_stops = {(ss, l, N_sparse_iter) : import_sparse_stops(ss, l, N_sparse_iter)
-                  for ss in List_ss 
-                  for l in Levels 
-                  for N_sparse_iter in Ranges_iter}
-
-    #import complete stops
-    PATH_stops_complete = DICT_paths['TMP'] + 'f_007_D1_lachesis_stops_AND_loc-1hdi/'
-    dur_min, dt_max, delta_roam = (10,360,50)
-    par_str = f'mintime_{dur_min}_maxdtime_{dt_max}_maxdiam_{delta_roam}'
-    df_stops_complete = pd.read_csv(PATH_stops_complete + 'df_stops_' + par_str + '.csv', 
-                                    index_col = 0, 
-                                    parse_dates = ['start_time', 'end_time']) 
-    df_stops_complete = filter_stops(df_stops_complete, 
-                                     USERS_select, 
-                                     (Date_range[0],Date_range[-1]))
-    DICT_stops['Complete'] = df_stops_complete
-    
-    return DICT_stops
-
-#[TODO] functions for importing contact metrics    
-
-#functions for importing epidemic modeling outcomes
-def get_groundtruth_epidpars(): 
-    '''
-    static function generating the groudtruth epidemiological parameters for simulation
-    '''
-    #epidemic groundtruth parameters 
-    scenario_epid = 'epid_grid_select_n1'
-    n_init = 3
-    N_iter = 100
-    
-    return scenario_epid, n_init, N_iter
-
-def get_groundtruth_epidpars_v2():
-    
-    #epidemic groundtruth parameters 
-    scenario_epid = 'epid_grid_select_n1'
-    n_init = 3
-    N_iter = 100
-    DICT_epid_pars = gen_dict_epid_pars()
-    epid_pars = DICT_epid_pars[scenario_epid]
-    beta, gamma = epid_pars[0], epid_pars[1]
-    
-    return beta, gamma, n_init
-
-    
-def gen_fold_epid(FOLD_exp = 'f01_011_D1_epidemic_simulations/'): 
-    '''
-    FOLD_exp: experimental folder, the current variants are:
-        - starting simulation from first day
-        - starting the simulation from first weekday
-
-    Returns the folder in which epidemiological simulations are stored
-    '''
-
-    scenario_epid, n_init, N_iter = get_groundtruth_epidpars()
-    DICT_epid_pars = gen_dict_epid_pars()
-    epid_pars = DICT_epid_pars[scenario_epid]
-    
-    _beta   = np.round(epid_pars[0]*100, 3)
-    _gamma  = np.round(epid_pars[1]*100, 3)
-    #_p_init = np.round(p_init*100, 2)
-    str_epid = scenario_epid
-    str_epid += f'_beta_{_beta}_gamma_{_gamma}_ninit_{n_init}_Niter_{N_iter}' 
-    
-    FOLD_emo = DICT_paths['TMP'] + FOLD_exp
-    FOLD_scenario_epid = FOLD_emo + str_epid + '/'
-
-    return FOLD_scenario_epid
-
-def get_emo_data(path_epid_stats, path_simulations):
-    
-    df_epid_stats = pd.read_csv(path_epid_stats, index_col = 0)
-    df_epid_stats = df_epid_stats.set_index('index').T
-
-    with open(path_simulations, 'rb') as f:
-        COLLECT_simulations = pickle.load(f)
-        
-    return df_epid_stats, COLLECT_simulations
-
-
-def get_emo_complete(FOLD_exp = 'f01_011_D1_epidemic_simulations/'):
-
-    FOLD_scenario_epid = gen_fold_epid(FOLD_exp = FOLD_exp)    
-    
-    path_epid_stats  = f'{FOLD_scenario_epid}df_epid_stats.csv'
-    path_simulations = f'{FOLD_scenario_epid}simulations.pkl' 
-    df_epid_stats, COLLECT_simulations = get_emo_data(path_epid_stats, path_simulations)
-    
-    return df_epid_stats, COLLECT_simulations
-
-def get_emo_sparse(FOLD_exp,
-                   Sparse_scenario_emv): 
-    '''
-    FOLD_exp: experiments folder
-    Sparse_scenario_emv: (s,l, N_si) 
-        - s : sparsity mechanism 
-        - l : sparsity level
-        - N_si : sparsification iteration
-        - emv  : implemented epidemic modeling variation
-            - standard, contact_rescaled, param_calibration_grid_v3
-    '''
-    
-    FOLD_epid_scenario = gen_fold_epid(FOLD_exp)
-    ss, l, N_si, emv = Sparse_scenario_emv
-    FOLD_iter = f'{FOLD_epid_scenario}/Iter_sparse_{N_si}/' 
-    FOLD_ss = f'{FOLD_iter}{ss}/'
-
-    if emv == 'standard':
-        path_epid_stats  = f'{FOLD_ss}df_epid_stats_{l}.csv'
-        path_simulations = f'{FOLD_ss}simulations_{l}.pkl' 
-        df_es_level, sim_level = get_emo_data(path_epid_stats, path_simulations)
-        return df_es_level, sim_level 
-    else: 
-        path_epid_stats  = f'{FOLD_ss}df_epid_stats_{l}_emv_{emv}.csv'
-        path_simulations = f'{FOLD_ss}simulations_{l}_emv_{emv}.pkl' 
-        df_es_level, sim_level = get_emo_data(path_epid_stats, path_simulations)
-        return df_es_level, sim_level
-
-def import_EMO_complete(FOLD_exp):
-    DICT_EMO = {}
-    df_epid_stats, COLLECT_simulations = get_emo_complete(FOLD_exp)
-    DICT_EMO['Complete'] = (df_epid_stats, COLLECT_simulations)
-    return DICT_EMO 
-
-def import_EMOs(FOLD_exp,
-                List_ss, 
-                Levels, 
-                Ranges_iter, 
-                EMVs):
-
-    DICT_EMO = import_EMO_complete(FOLD_exp) 
-    #update joining the results also from the other sparsity scenarios
-    DICT_EMO.update({(s,l, N_si, emv): get_emo_sparse(FOLD_exp, (s,l, N_si, emv)) 
-                     for s in List_ss 
-                     for l in Levels
-                     for N_si in Ranges_iter 
-                     for emv in EMVs}) 
-    
-    return DICT_EMO
-
-
-
-def get_emo_sparse_calibration_gridrmse(FOLD_exp,
-                                        Sparse_scenario, 
-                                        grid_version = 'v3'): 
-    '''
-    Returns the rmse df for each grid elements for a specific sparsity scenario
-    rmse default computation is over the curve of susceptibles
-
-    FOLD_exp: experiments folder
-    Sparse_scenario_emv: (s,l, N_si) 
-        - s : sparsity mechanism 
-        - l : sparsity level
-        - N_si : sparsification iteration
-    '''
-    
-    FOLD_epid_scenario = gen_fold_epid(FOLD_exp)
-    ss, l, N_si = Sparse_scenario
-    FOLD_iter = f'{FOLD_epid_scenario}/Iter_sparse_{N_si}/' 
-    FOLD_ss = f'{FOLD_iter}{ss}/'
-    FOLD_grid = f'{FOLD_ss}grid_search_info/'
-    path_grid_rmse = f'{FOLD_grid}df_epg_rmse_{l}_grid_{grid_version}.csv'
-    df_grid_rmse = pd.read_csv(path_grid_rmse, index_col = 0)
-    
-    return df_grid_rmse
-
-def import_EMO_calibration_rmse(FOLD_exp,
-                                List_ss, 
-                                Levels, 
-                                Ranges_iter, 
-                                grid_version = 'v3'):
-    '''
-    dictionary of rmse values for each (s, l, N_si) instance
-    '''
-
-    DICT_calibration_grid_rmse = {(s,l,N_si): get_emo_sparse_calibration_gridrmse(FOLD_exp,
-                                                                                  (s,l,N_si), 
-                                                                                  grid_version = grid_version)
-                                  for s in List_ss 
-                                  for l in Levels
-                                  for N_si in Ranges_iter}
-    
-    return DICT_calibration_grid_rmse    
-
-def get_path_sparse_scenario(FOLD_exp, 
-                             Sparse_scenario):
-    '''
-    Import grid simulations for a given sparsity scenario
-    '''
-    FOLD_epid_scenario = gen_fold_epid(FOLD_exp)
-    ss, l, N_si = Sparse_scenario
-    FOLD_iter = f'{FOLD_epid_scenario}Iter_sparse_{N_si}/' 
-    FOLD_ss = f'{FOLD_iter}{ss}/'
-    return FOLD_ss
-    
-def get_path_grid_experiments(FOLD_exp,
-                              Sparse_scenario): 
-    
-    FOLD_ss = get_path_sparse_scenario(FOLD_exp, 
-                                       Sparse_scenario)
-    
-    FOLD_grid = f'{FOLD_ss}grid_search_info/'
-    
-    return FOLD_grid
-
-def get_path_grid_rmse(FOLD_exp, 
-                       Sparse_scenario, 
-                       grid_version = 'v3'):
-
-    s,l,N_si = Sparse_scenario
-
-    FOLD_grid = get_path_grid_experiments(FOLD_exp, Sparse_scenario)
-    path_grid_rmse = f'{FOLD_grid}df_epg_rmse_{l}_grid_{grid_version}.csv'
-    return path_grid_rmse
-
-#simulate for a specific grid element
-def import_grid_element_simulation(FOLD_grid,
-                                   grid_point, 
-                                   l, 
-                                   grid_version, 
-                                   N_grid_iter = 100):
-    
-    grid_par, n_init = grid_point[:2], grid_point[2]
-    _beta    = np.round(grid_par[0]*100, 6)
-    _gamma   = np.round(grid_par[1]*100, 6)
-    str_epid = f'_beta_{_beta}_gamma_{_gamma}_ninit_{n_init}_Niter_{N_grid_iter}' 
-    with open(f'{FOLD_grid}simulations_{l}_{str_epid}_grid_{grid_version}.pkl', 'rb') as f:
-        COLLECT_simulations = pickle.load(f)
-        
-    return COLLECT_simulations
-
-def import_grid_simulations(FOLD_exp, 
-                            Sparse_scenario, 
-                            GRID, 
-                            grid_version):
-    '''
-    Import all simulations for the grid points
-    '''
-    
-    s,l,N_si = Sparse_scenario
-    
-    FOLD_grid = get_path_grid_experiments(FOLD_exp,
-                                          Sparse_scenario)
-
-    DICT_grid_sims = {grid_point: import_grid_element_simulation(FOLD_grid,
-                                                                 grid_point, 
-                                                                 l, 
-                                                                 grid_version,
-                                                                 N_grid_iter = 100)
-                      for grid_point in GRID}
-    
-    return DICT_grid_sims
-
-def compute_mean_sim(Sim_c):
-    '''
-    Colection of simulations
-    returns mean_S, mean_I, mean_CC 
-    where [S,I] : [Susceptibles, Infected]#, Cumulative cases]
-    '''
-    #compute average [S,I, Cumulative cases] over simulations
-    mean_S  = np.mean(Sim_c[:,:,0], axis = 0)
-    mean_I  = np.mean(Sim_c[:,:,1], axis = 0) 
-    #mean_CC = np.mean(N_pop - Sim_c[:,:,0], axis = 0)
-    return mean_S, mean_I
-
-def compute_median_sim(Sim_c):
-    '''
-    Colection of simulations
-    returns mean_S, mean_I
-    where [S,I] : [Susceptibles, Infected]
-    '''
-    #compute average [S,I, Cumulative cases] over simulations
-    median_S  = np.median(Sim_c[:,:,0], axis = 0)
-    median_I  = np.median(Sim_c[:,:,1], axis = 0) 
-    #mean_CC = np.mean(N_pop - Sim_c[:,:,0], axis = 0)
-    return median_S, median_I
-
-def compute_mean_delta_sim(Sim_c):
-    '''
-    Colection of simulations
-    returns mean_dS, mean_dI
-    where [S,I] : [Susceptibles, Infected]
-    '''
-    #compute average [delta_S, delta_I] over simulations
-    mean_dS  = np.mean(np.diff(Sim_c[:,:,0], axis=1), axis=0)
-    mean_dI  = np.mean(np.diff(Sim_c[:,:,1], axis=1), axis=0)
-    
-    return mean_dS, mean_dI
-
-
-def compute_rmse(Sim_c, Sim_g0):
-    '''
-    Sim_c, Sim_g0 : two collection of epidemic simulations
-    returns [rmse_S, rmse_I]
-    '''
-    
-    Means_c = compute_mean_sim(Sim_c)
-    Means_g0 = compute_mean_sim(Sim_g0) 
-
-    Medians_c = compute_median_sim(Sim_c)
-    Medians_g0 = compute_median_sim(Sim_g0)
-    
-    Rmse_g0 = [np.sqrt( np.mean((c - c_g0)**2) ) for c,c_g0 in zip(Means_c, Means_g0)]
-    Rmse_median_g0 = [np.sqrt( np.mean((c - c_g0)**2) ) for c,c_g0 in zip(Medians_c, Medians_g0)]
-    
-    return Rmse_g0, Rmse_median_g0
-
-
-def get_em_vals(DICT_EMO_metrics, k, em, N_users, 
-                norm = False):
-    '''
-    Import epidemic metric values
-    k  : scenario
-    em : epidemic metric
-    '''
-    #Ordered list of epidemic metrics as computed from EMO collection
-    Emo_metrics_names = ['peak_day', 'peak_size', 'final_size', 'epid_duration', 'day_final_case'] 
-    ind_epid_metric = Emo_metrics_names.index(em)
-    
-    if norm and em in ['peak_size', 'final_size']:
-        return 100*DICT_EMO_metrics[k][:,ind_epid_metric]/N_users
-    else:
-        return DICT_EMO_metrics[k][:,ind_epid_metric]
-
-
-#given an epidemic ensemble, compute the fraction of epidemics which die-out
-#FRACTION OF FALSE NEGATIVES UNDER DIFFERENT MECHANISMS
-def get_fraction_levels_FN(DICT_EMO_metrics,
-                           Levels,
-                           s,N_si, emv,
-                           N_users,
-                           Th_max_infected_perc = 1, 
-                           em = 'peak_size',
-                           include_complete = False):
-    '''
-    Return fractions of epidemics which die-out for each sparsity level
-    List having length of Levels
-    get for each sparsity range the fraction of False Negative epidemic realizations
-    that is, epidemics for which the Max of daily infected percentage is below a Thresold (default 1%)
-    '''
-    #function for computing the percentage of false negatives
-    p_FN = lambda x : np.sum(x<Th_max_infected_perc)/len(x)
-
-    Ks = [(s,l, N_si, emv) for l in Levels]
-    if include_complete:
-        Ks = ['Complete'] + Ks
-
-    p_FNs = [p_FN(get_em_vals(DICT_EMO_metrics, k, em, N_users, norm = True)) 
-             for k in Ks]
-    
-    return np.array(p_FNs)
-
-
-def get_fraction_levels_FN_complete(DICT_EMO_metrics,
-                                    N_users,
-                                    Th_max_infected_perc = 1,     
-                                    em = 'peak_size'):
-    '''
-    Return fractions of epidemics which die-out for each sparsity level
-    List having length of Levels
-    get for each sparsity range the fraction of False Negative epidemic realizations
-    that is, epidemics for which the Max of daily infected percentage is below a Thresold (default 1%)
-    '''
-    #function for computing the percentage of false negatives
-    p_FN = lambda x : np.sum(x < Th_max_infected_perc)/len(x)
-    p_FNs = [p_FN(get_em_vals(DICT_EMO_metrics, 'Complete', em, N_users, norm = True))]
-    
-    return np.array(p_FNs)
-
-#import gap masks
-def get_gap_mask(Sparse_scenario):
-    s,l,N_si = Sparse_scenario
-    FOLD_sparse = DICT_paths['TMP'] + 'f01_013_D1_iter_sparsified_mask_loc_stops_contacts/'
-    path_ss = f'{FOLD_sparse}Iter_sparse_{N_si}/{s}/{l}/'
-    df_mask = pd.read_csv(f'{path_ss}df_mask.csv', index_col = 0)
-    return df_mask
-
-def import_masks(List_ss, 
-                 Levels, 
-                 Ranges_iter):
-
-    #update joining the results also from the other sparsity scenarios
-    DICT_masks = {(s,l, N_si): get_gap_mask((s,l, N_si)) 
-                  for s in List_ss 
-                  for l in Levels
-                  for N_si in Ranges_iter} 
-    
-    return DICT_masks
-
-
-#########################################################
-######### MODEL CALIBRATION WITH OPTUNA #################
-#########################################################
-
-def gen_dict_coi(EMO_sims): 
-    '''
-    compute the curves of interest (coi) 
-    from an ensemble of population
-    '''
-    
-    #Construct the possible reference curves
-    mean_S, mean_I = compute_mean_sim(EMO_sims)
-    median_S, median_I = compute_median_sim(EMO_sims)
-    mean_delta_S, mean_delta_I = compute_mean_delta_sim(EMO_sims)
-    
-    DICT_ref_curves = {'mean_S': mean_S, 
-                       'mean_I': mean_I, 
-                       'median_S': median_S, 
-                       'median_I': median_I, 
-                       'mean_delta_S': mean_delta_S, 
-                       'mean_delta_I': mean_delta_I}
-    
-    return DICT_ref_curves
-
-def gen_reference_curve(DICT_EMO, metric_ref): 
-    '''
-    generate the reference curve used for the objective function computation
-    '''
-    Sims_complete = DICT_EMO['Complete'][1]
-    curve_reference = gen_dict_coi(Sims_complete)[metric_ref]
-    return curve_reference
-
-#define the function for obtai
-def generate_sparse_sims(params,
-                         Contacts_sparse, 
-                         USERS_select,
-                         Dates, 
-                         N_iter, 
-                         from_weekday = True):
-    '''
-    params: set of epidemiological parameters (beta, gamma, seedsize)
-    Contacts_sparse: daily sequence of sparse contacs
-    USERS_select: selected users
-    Dates: dates involved in the simulation
-    N_iter: number of simulations
-    from_weekday: condition for starting the simulations from the first weekday
-    '''
-
-    beta, gamma, seedsize = params
-
-    Sims, _ = iter_epid_simulation(Contacts_sparse, 
-                                   Dates,
-                                   USERS_select, 
-                                   pars = (beta, gamma), 
-                                   n_init = seedsize,
-                                   N_iter = N_iter, 
-                                   from_weekday = from_weekday)
-
-    return Sims
-
-
-def compute_objective_function(params, 
-                               Curve_ref,
-                               metric_ref,
-                               Contacts_sparse, 
-                               USERS_select,
-                               Date_range, 
-                               N_iter = 100, 
-                               obj_metric = 'RMSE',
-                               from_weekday = True): 
-    
-    Sims_sparse = generate_sparse_sims(params,
-                                       Contacts_sparse, 
-                                       USERS_select,
-                                       Date_range, 
-                                       N_iter = N_iter, 
-                                       from_weekday = from_weekday)
-    
-    Curve_sparse = gen_dict_coi(Sims_sparse)[metric_ref]
-
-    if obj_metric == 'RMSE':
-        RMSE = np.sqrt(np.mean((Curve_sparse - Curve_ref)**2))
-        return RMSE
-    if obj_metric =='MAE':
-        MAE = np.mean(np.abs(Curve_sparse - Curve_ref))
-        return MAE
-
-def get_study_best_params(study):
-    
-    #Compare the groundtruth with the outcome from sparse data
-    dict_best_params = study.best_params 
-    beta  = dict_best_params['beta']
-    gamma = dict_best_params['gamma']
-    seedsize = dict_best_params['seedsize']
-    
-    best_params = (beta, gamma, seedsize)
-
-    return best_params
-
-class Objective_param_search:
-
-    def __init__(self, 
-                 Curve_ref,
-                 obj_metric,
-                 GRID_stats, 
-                 Contacts_dict, 
-                 sparse_scenario, 
-                 metric_ref,
-                 USERS_select, 
-                 Date_range, 
-                 N_iter=100, 
-                 from_weekday=True):
-        
-        self.Curve_ref = Curve_ref
-        self.obj_metric = obj_metric
-        self.GRID_stats = GRID_stats
-        self.Contacts_dict = Contacts_dict
-        self.sparse_scenario = sparse_scenario
-        self.metric_ref = metric_ref
-        self.USERS_select = USERS_select
-        self.Date_range = Date_range
-        self.N_iter = N_iter
-        self.from_weekday = from_weekday
-    
-    def __call__(self, trial):
-
-        GRID_stats = self.GRID_stats
-        beta = trial.suggest_float("beta", GRID_stats.loc["min", "beta"], GRID_stats.loc["max", "beta"])
-        gamma = trial.suggest_float("gamma", GRID_stats.loc["min", "gamma"], GRID_stats.loc["max", "gamma"])
-        seedsize = trial.suggest_int("seedsize", int(GRID_stats.loc["min", "seedsize"]), int(GRID_stats.loc["max", "seedsize"]))
-        
-        params = (beta, gamma, seedsize) 
-        
-        Objective_param_search = compute_objective_function(params, 
-                                                            self.Curve_ref,
-                                                            self.metric_ref,
-                                                            self.Contacts_dict[self.sparse_scenario], 
-                                                            self.USERS_select,
-                                                            self.Date_range, 
-                                                            N_iter = self.N_iter,
-                                                            obj_metric = self.obj_metric,
-                                                            from_weekday = self.from_weekday)
-        
-        return Objective_param_search
-
-def optuna_param_search(Curve_ref, 
-                        metric_obj,
-                        GRID_stats, 
-                        DICT_contacts, 
-                        sparse_scenario, 
-                        metric_ref,
-                        USERS_select, 
-                        Date_range, 
-                        N_iter=100, 
-                        from_weekday=True, 
-                        n_trials = 100):
-
-    study = optuna.create_study(direction="minimize") 
-        
-    Obj = Objective_param_search(Curve_ref, 
-                                 metric_obj,
-                                 GRID_stats, 
-                                 DICT_contacts, 
-                                 sparse_scenario, 
-                                 metric_ref,
-                                 USERS_select, 
-                                 Date_range, 
-                                 N_iter= N_iter, 
-                                 from_weekday = from_weekday)
-
-    study.optimize(Obj, 
-                   n_trials = n_trials, 
-                   show_progress_bar = True) 
-    
-    return study
-
-###############################################
-######### CONTACT CORRECTIONS #################
-###############################################
-
-def import_record_indicator_complete_users(SW_width_days = 28, 
-                                           epsilon = 0.05):
-    '''
-    dataframe of hourly record indicator for complete users obtained from 
-    Sliding window of 28 days
-    tolerance of 5%
-    '''
-    
-    #import sample of gap sequences
-    path_gap_seq = '/home/fedde/work/Project_Penn/TMP/f01_009_D1_gap_sequence_sample/'
-    path_gap_seq += f'df_gapseq_epidwindowdays_{SW_width_days}_epsilon_{epsilon}_hourstol_33.csv'
-    df_gap_seq = pd.read_csv(path_gap_seq)
-    
-    #hourly record indicator for complete users
-    df_hri_uc = df_gap_seq.query(f'sparse == {False} & weekstep_index ==0')
-    
-    df_hri_uc = df_hri_uc.drop(['sparse','weekstep_index'], axis =1).set_index('id')
-    
-    return df_hri_uc
-
-def get_sparse_record_indicator(Date_range, k):
-    '''
-    Return the hourly record indicator for the sparsified complete users within a given date-range
-    Date_range : list of 2 datetimes
-    k = (s, l, N_si) ;
-        s : mechanism
-        l : level 
-        N_si : sparsification iteration  
-    '''
-    
-    #[0] import the missingness mask within the given daterange
-    mask_k = import_sparse_mask(*k).T
-    mask_k.index = pd.to_datetime(mask_k.index)
-    #select the mask within the study period
-    mask_k = mask_k.loc[(mask_k.index >= Date_range[0]) 
-                         & (mask_k.index <= Date_range[-1]+dt.timedelta(days=1))]
-    
-    #[1] import the hourly record indicator
-    df_hri_uc = import_record_indicator_complete_users().T
-    df_hri_uc.index = pd.to_datetime(df_hri_uc.index)
-    df_hri_uc = df_hri_uc.loc[mask_k.index][mask_k.columns]
-    
-    #[2] overlay the mask on the hourly record indicator
-    df_hri_uc = df_hri_uc*mask_k
-
-    return df_hri_uc
-
-def gen_coefs_coupled(coef):
-    '''
-    coef: series with:
-        - index : associated to the user 
-        - value : completness coefficient (global or hourly) 
-    return matrix with coupled coefficients : 1/(c_i*c_j)
-    '''
-    with np.errstate(divide='ignore', invalid='ignore'):
-        inv_outer = 1 / np.outer(coef.values, coef.values)
-        inv_outer[np.isinf(inv_outer)] = 0  # Set infinities to 0
-        inv_outer[np.isnan(inv_outer)] = 0 
-        R_coefs = pd.DataFrame(inv_outer, 
-                               index   = coef.index, 
-                               columns = coef.index)
-        return R_coefs
-
-def gen_normalized_hourly_coefs(coef_hourly):
-    '''
-    compute normalized hourly coefficients
-    '''
-    
-    #Compute the coupled coefficients for each hour
-    List_coefs_coupled = [gen_coefs_coupled(coef_hourly.loc[h]) for h in range(24)]
-    
-    #Normalize each set of 24 hourly coefficients for each trajectory couple
-    Alpha_coefs = 24/sum(List_coefs_coupled)
-    
-    #Rescale the coefficients by the normalization factor
-    List_coefs_coupled = [Alpha_coefs*C for C in List_coefs_coupled]
-    
-    #Rearrange the coefs into one single dataframe
-    df_coefs_coupled = []
-    for hour in range(24):
-        df_long = List_coefs_coupled[hour].stack()#.reset_index()
-        df_long = List_coefs_coupled[hour].stack()
-        df_long.index.set_names(['u1', 'u2'], inplace=True)
-        df_long = df_long.reset_index(name='rescaling_coef')
-        df_long['hour'] = hour
-        df_coefs_coupled.append(df_long)
-        
-    df_coefs_coupled = pd.concat(df_coefs_coupled, axis=0)
-
-    return df_coefs_coupled
-
-
-
-def aggregate_daily_contacts(df_c):
-    '''
-    aggregate contact durations at daily resolution
-    clip duration to max. duration in a day: 1440
-    '''
-    df_c['date'] = pd.to_datetime(df_c['date_hour']).dt.date
-    df_c_daily = df_c.groupby(['date','u1','u2']).agg('n_minutes').sum().clip(upper = 1440)
-    df_c_daily = df_c_daily.reset_index()
-    return df_c_daily
-
-def gen_df_compare_contacts(df_contacts_daily, 
-                            C_k_daily):
-    '''
-    Generate dataframe of daily contacts (compare Complete against Sparse)
-
-    df_contacts_daily : dataset of groundtruth contacts
-    C_k_daily: dataset of contacts from sparse trajectories
-    '''
-
-    df_merged = df_contacts_daily.rename(columns={'n_minutes': 'n_minutes_complete'}).merge(
-        C_k_daily.rename(columns={'n_minutes': 'n_minutes_sparse'}),
-        on=['date', 'u1', 'u2'],
-        how='outer').fillna(0)
-    
-    return df_merged 
-
-def classify_contacts_sparse(df_merged):
-    '''
-    classify a sparse contact according to its change in duration
-    new classification column is 'sparse_contact_class'
-    '''
-
-    conditions = [df_merged['n_minutes_sparse']== df_merged['n_minutes_complete'], 
-                  (df_merged['n_minutes_sparse'] < df_merged['n_minutes_complete']) & (df_merged['n_minutes_sparse']!=0),
-                  df_merged['n_minutes_sparse'] > df_merged['n_minutes_complete'],
-                  df_merged['n_minutes_sparse'] == 0.0]
-    
-    choices = ['unchanged', 
-               'reduced', 
-               'increased', 
-               'eliminated']
-
-    df_merged['sparse_contact_class'] = np.select(conditions, choices)
-
-def compare_contact_stats(df_contacts_daily, 
-                          C_k_daily):
-    
-    List_contact_durations = [df_contacts_daily['n_minutes'].values, 
-                              C_k_daily['n_minutes'].values]
-    
-    df_merged = gen_df_compare_contacts(df_contacts_daily, 
-                                        C_k_daily)
-    
-    classify_contacts_sparse(df_merged)
-    df_merged['delta_duration'] = df_merged['n_minutes_sparse'] - df_merged['n_minutes_complete']
-    
-    return df_merged
-
-def bin_contact_durations(df, bin_size):
-    
-    x_bins = np.arange(0, 1440 + bin_size, bin_size)
-    y_bins = np.arange(0, 1440 + bin_size, bin_size)
-    range_bins = np.arange(len(x_bins))
-    
-    heatmap_data, xedges, yedges = np.histogram2d(
-        df["n_minutes_complete"].values,
-        df["n_minutes_sparse"].values,
-        bins=[x_bins, y_bins])
-    
-    return heatmap_data
-
-
-def gen_contact_comparison(ipw_type = 'ipw_global',
-                           s = 'Data_driven',
-                           N_iter = 0): 
-
-    df_contacts, USERS_select, Date_range = import_complete_contacts_users_drange() 
-    df_contacts_daily = aggregate_daily_contacts(df_contacts)
-    Date_range_fromweekday = convert_daterange_from_weekday(Date_range)
-    Dates = Date_range_fromweekday.date
-    Dates_plus1 = np.append(Dates, Dates[-1]+dt.timedelta(days=1))
-
-    Levels = gen_sparsity_ranges()
-
-    DICT_compare_contacts = {}
-    for l in Levels: 
-        #generate the contacts (groundtruth, sparsity-induced and corrected)
-        Sparse_scenario = (s, l, N_iter)
-        Contacts_sparse = import_sparse_contacts(*Sparse_scenario)
-        Contacts_sparse_rescaled = ipw_rescale_contacts(Sparse_scenario, 
-                                                        USERS_select, 
-                                                        Date_range_fromweekday, 
-                                                        rescaling = ipw_type,
-                                                        return_contact_dataframe = True) 
-        
-        DICT_contacts = {'sparse': Contacts_sparse,
-                         'sparse_corrected': Contacts_sparse_rescaled}
-        
-        DICT_contacts_daily = {k: aggregate_daily_contacts(C) 
-                               for k,C in DICT_contacts.items()}
-        
-        DICT_compare_contacts.update({(k,l): compare_contact_stats(df_contacts_daily, C) 
-                                     for k, C in DICT_contacts_daily.items()})
-        
-    return DICT_compare_contacts
-
-def compute_R0_groundtruth(C, gamma_daily = False):
-    C_ = C.copy().rename(columns = {'n_minutes_sparse': 'n_minutes'})
-    epid_pars, n_init, N_iter = gen_complete_epid_groundtruth()    
-    C_R0 = compute_R0_daily(C_, epid_pars, gamma_daily = gamma_daily)
-    return C_R0
-
-def compute_R0_epid_pars(C, epid_pars, gamma_daily = False):
-    C_ = C.copy().rename(columns = {'n_minutes_sparse': 'n_minutes'})
-    C_R0 = compute_R0_daily(C_, epid_pars, gamma_daily = gamma_daily)
-    return C_R0
-
-
-#########################################################
-######### SPARSITY MODELING - FOR FUTURE WORK ###########
-#########################################################
-
-
-def alternate_exp_sampling(P, N_hours):
-    '''
-    this algorithm tries to emulate the alternating mechanism of phone usage and not-usage 
-    it start with a phone-usage interval
-    '''
-    j = 0
-    gap_seq = [j]
-    
-    while j < N_hours:
-        #record interval generation
-        j+= np.random.exponential(1/(1-P))
-        gap_seq.append(j)
-        #gap interval generation
-        j+= np.random.exponential(1/P)
-        gap_seq.append(j)
-
-    #minute conversion
-    gap_seq_min = (np.array(gap_seq)*60).astype(int)
-    gap_seq_min = gap_seq_min[gap_seq_min < (60*N_hours - 1)]
-    
-    return gap_seq_min
-
-def gen_alternate_poisson_mask(P, USERS_select, Date_range):
-    '''
-    iplement alternate extraction from a geometric distribution
-    '''
-
-    #date range at minute resolution
-    N_hours = int((Date_range[1] - Date_range[0]).total_seconds() /3600)
-    dr_min = pd.date_range(Date_range[0], Date_range[1],freq = 'min', inclusive = 'left')
-    df_rec_ind = pd.DataFrame(0, index=dr_min, columns=USERS_select)
-    
-    for i in range(len(USERS_select)):
-        g_seq = alternate_exp_sampling(P, N_hours)
-        df_rec_ind.iloc[g_seq,i] = 1
-    
-    #ensure that all boolean sequences sum up to an even number
-    Ind = (df_rec_ind.sum(axis=0)%2==0)
-    Ind_users = df_rec_ind.sum(axis=0)[~Ind]
-    df_rec_ind.loc[dr_min[-1],Ind_users.index]=1
-    
-    #create the record minute indicator
-    df_rec_ind = df_rec_ind.apply(lambda x : interp_boolean(x), axis=0)
-    df_rec_ind = df_rec_ind.T
-    
-    return df_rec_ind
-
-
-def create_graph(df_CT): 
-    
-    G = nx.Graph()
-    G.add_edges_from((row['u1'], row['u2'],
-                      {'weight': row['n_minutes']}) for _, row in df_CT.iterrows())
-    return G 
-
-def compute_contact_metrics(df_CT, 
-                            Percs = [0,25,50,75,100], 
-                            return_size = False):
-
-    G = create_graph(df_CT)
-
-    if return_size: 
-        n,e = len(G.nodes), len(G.edges)
-        return pd.DataFrame([[n,e]], columns = ['nodes', 'edges'])
-    
-    DICT_Percs = {"contact_duration_iqr": np.percentile(df_CT['n_minutes'], Percs, method = 'nearest'),
-                  "degree_iqr": np.percentile(list(dict(G.degree()).values()), Percs), 
-                  "weighted_degree_iqr": np.percentile(list(dict(G.degree(weight = 'weight')).values()), Percs),
-                  "clustering_iqr": np.percentile(list(nx.clustering(G).values()), Percs)} 
-                  #"weighted_clustering_iqr": np.percentile(list(nx.clustering(G, weight = 'weight').values()), Percs)}
-    
-    df_results = pd.DataFrame(DICT_Percs)
-    df_results.index = ['min', 'iqr25', 'median', 'iqr75', 'max']
-    
-    return df_results
-
-    
-def contact_estimate_daily_partition(df_lcf_stops, ghr, only_last_day = False):
-    '''
-    subset the stop table by day and evaluate the contacts and concatenate them
-    '''
-    
-    USERS = df_lcf_stops['id'].unique()
-    Study_period = (df_lcf_stops['start_time'].min().date(),
-                    df_lcf_stops['end_time'].max().date())
-    #Partition the study period into 1day intervals
-    SP_partition = pd.date_range(Study_period[0], Study_period[1] + dt.timedelta(days = 2), freq = 'D')
-    SP_partition = [(a1,a2) for a1,a2 in zip(SP_partition[:-1], SP_partition[1:]) ]
-
-    if only_last_day: 
-
-        SP0 = SP_partition[-1]
-        #print(SP0)
-        df_stops_SP = filter_stops(df_lcf_stops, 
-                                   USERS,  
-                                   Date_range = SP0)
-        
-        df_cwithin, df_cmargin = estimate_contacts(df_stops_SP, ghr)
-        return df_cwithin, df_cmargin
-    
-        
-    #FIRST DAY
-    SP0 = SP_partition[0]
-    #print(SP0)
-    df_stops_SP = filter_stops(df_lcf_stops, 
-                               USERS,  
-                               Date_range = SP0)
-    
-    df_cwithin, df_cmargin = estimate_contacts(df_stops_SP, ghr)
-
-    #FOLLOWING DAYS
-    for SP0 in SP_partition[1:-1]:
-        
-        #print(SP0)
-        df_stops_SP = filter_stops(df_lcf_stops, 
-                                   USERS,  
-                                   Date_range = SP0)
-    
-        df_cwithin_s, df_cmargin_s = estimate_contacts(df_stops_SP, ghr)
-        
-        #attach these 2dfs to df_cwithin and to df_cmargin
-        df_cwithin = pd.concat([df_cwithin, df_cwithin_s], ignore_index=True)
-        df_cmargin = pd.concat([df_cmargin, df_cmargin_s], ignore_index=True)
-
-    return df_cwithin, df_cmargin
-
-
-def compute_features_nx(G_d, 
-                        return_names = False):
-    '''
-    daily contact weightx nx Graph
-    '''
-
-    if return_names:
-        return ['nodes_positive_degree', 'size_largest_cc']
-    #number of nodes with positive degree
-    N_nodes_degree_pos = sum(1 for node, degree in G_d.degree() if degree > 0)
-
-    #size of largest connected component
-    Size_largest_cc = len(max(nx.connected_components(G_d), key=len)) 
-
-    NX_metrics = np.array([[N_nodes_degree_pos, Size_largest_cc]])
-
-    return np.array(NX_metrics)
-
-def compute_node_networkcontraint(P, i):
-    #P is the normalized adjacency matrix
-    p_i = P[i]
-    #index of the neighbours
-    Gamma_i_inds = np.argwhere(p_i != 0).ravel()
-    if len(Gamma_i_inds) > 0:
-        p_i = p_i[Gamma_i_inds]
-        P_gamma_i = P[np.ix_(Gamma_i_inds, Gamma_i_inds)]
-        p_nc_i = np.dot(P_gamma_i, p_i)
-        p_i = p_i + p_nc_i
-        return np.sum(p_i**2)
-    else:
-        return 0
-
-def compute_features_node(G_d, 
-                          return_names = False):
-    '''
-    G_d: networkx graph
-    '''
-
-    if return_names: 
-        return ['degree', 'cumulative_time', 'network_constraint', 'clustering']
-
-    X = nx.to_numpy_array(G_d)
-    #degree
-    Degrees = np.sum(1*(X>0), axis = 0)
-    #cumulative time in contact
-    CTC = np.sum(X, axis=0)
-    
-    #network contraints values
-    row_sums = X.sum(axis=1, keepdims=True)
-    row_sums[row_sums == 0] = 1
-    P = X / row_sums
-    NCs = np.array([compute_node_networkcontraint(P,i) for i in range(len(P))])
-
-    #clustering coefficient values
-    CCs = np.array(list(nx.clustering(G_d).values()))
-
-    #collection of metrics
-    Metrics = [Degrees, CTC, NCs, CCs]
-
-    return np.stack(Metrics, axis=1)
-
-#hourofday-weekperiod coverage
-def gen_hw_col(v):
-    '''
-    gen hourofday_weekday column
-    '''
-    v = pd.to_datetime(v)
-    _wdays = [0,1,2,3,4,5]
-    _wperiod = np.array(['weekend','weekday'])
-    return [f"{t}_{_wperiod[w*1]}" for t,w in zip(v.hour, v.weekday.isin(_wdays))] 
-
-def align_temporally_contact_coverages(C_k, R_k):
-    '''
-    align the coverage and the contact-data
-    '''
-    Dates_common = np.intersect1d(C_k['date'], np.unique(R_k.index.date))
-    C_k = C_k[C_k['date'].isin(Dates_common)]
-    R_k =  R_k[ [d in Dates_common for d in R_k.index.date]]#.isin(Dates_common) ]
-    return C_k, R_k
-
-def compute_coef_aligned(R_k):
-    '''
-    compute globally aligned coefficients
-    '''
-    return pd.DataFrame(np.dot(R_k.T,R_k)/len(R_k), 
-                        index = R_k.columns, 
-                        columns = R_k.columns)
-
-def compute_coef_aligned_timebucket(R_k, h):
-    '''
-    compute aligned coefficients on different temporal buckets
-    '''
-    R_k_h = R_k.copy()
-    if h == 'hourofday_weekday':
-        R_k_h[h] = gen_hw_col(R_k.index.values)
-    if h == 'date':
-        R_k_h[h] = R_k.index.date
-    return R_k_h.groupby(h).apply(lambda df : compute_coef_aligned(df))
-
-def import_contacts_coverage(k, Date_range):
-    '''
-    return contact and coverage data within a specific missingness scenario
-    '''
-    
-    #[0] import the sparsified user hourly record indicator
-    R_k = get_sparse_record_indicator(Date_range, k)
-    
-    #[1] import the sparsity induced contacts
-    C_k = import_sparse_contacts(*k)
-    C_k['hour'] = pd.to_datetime(C_k['date_hour']).dt.hour
-    C_k['date'] = pd.to_datetime(C_k['date_hour']).dt.date
-    C_k['hourofday_weekday'] = gen_hw_col(C_k['date_hour'].values)
-    
-    C_k, R_k = align_temporally_contact_coverages(C_k,R_k)
-    
-    return C_k, R_k
-
-def compute_weight_trim(df_wg2, weight):
-        '''
-        compute weight trim from inverse probabilistic weighting 
-        '''
-        Ws = df_wg2[weight].dropna().values
-        Ws_cv = np.std(Ws)/np.mean(Ws)
-        Ws_med = np.median(Ws)
-        Ws_trim = 3.5*np.sqrt(1 + Ws_cv**2)*Ws_med
-        return Ws_trim
-
-def compute_coefs(C_k, R_k, Contact_corrections): 
-    '''
-    compute all coefficients on different temporal buckets
-    '''
-
-    #[0] Coverage coefficients
-    coef_global = compute_coef_aligned(R_k)
-    coef_daily  = compute_coef_aligned_timebucket(R_k, 'date')
-    coef_hw     = compute_coef_aligned_timebucket(R_k, 'hourofday_weekday')
-    coefs_dict = {'global': coef_global, 
-                  'daily': coef_daily, 
-                  'hourofday_weekday': coef_hw}
-    
-    C_k['c1_global']  = C_k.apply(lambda row: coef_global.loc[row['u1'], row['u1']], axis = 1)
-    C_k['c2_global']  = C_k.apply(lambda row: coef_global.loc[row['u2'], row['u2']], axis = 1)
-    C_k['c12_global']  = C_k.apply(lambda row: coef_global.loc[row['u1'], row['u2']], axis = 1)
-    C_k['c1_daily']  = C_k.apply(lambda row: coef_daily.loc[row['date']].loc[row['u1'], row['u1']], axis = 1)
-    C_k['c2_daily']  = C_k.apply(lambda row: coef_daily.loc[row['date']].loc[row['u2'], row['u2']], axis = 1)
-    C_k['c12_daily']  = C_k.apply(lambda row: coef_daily.loc[row['date']].loc[row['u1'], row['u2']], axis = 1)
-    C_k['c1_how']  = C_k.apply(lambda row: coef_hw.loc[row['hourofday_weekday']].loc[row['u1'], row['u1']], axis = 1) 
-    C_k['c2_how']  = C_k.apply(lambda row: coef_hw.loc[row['hourofday_weekday']].loc[row['u2'], row['u2']], axis = 1) 
-    C_k['c12_how']  = C_k.apply(lambda row: coef_hw.loc[row['hourofday_weekday']].loc[row['u1'], row['u2']], axis = 1)
-    
-    def compute_denom(rescaling):
-        if rescaling == 'ipw_global':
-            denom = C_k['c1_global'] * C_k['c2_global']
-        elif rescaling == 'ipw_daily':
-            denom = C_k['c1_daily'] * C_k['c2_daily']
-        elif rescaling == 'ipw_hourofday_weekday':
-            denom = C_k['c1_how'] * C_k['c2_how']
-        elif rescaling == 'ipw_global_aligned':
-            denom = C_k['c12_global']
-        elif rescaling == 'ipw_daily_aligned':
-            denom = C_k['c12_daily']
-        elif rescaling == 'ipw_hourofday_weekday_aligned':
-            denom = C_k['c12_how']
-        else:
-            raise ValueError(f"Unknown rescaling type: {rescaling}")
-        # Replace 0 or NaN with 1
-        denom_safe = denom.replace(0, 1).fillna(1)
-        return denom_safe
-
-        
-    #[1] Weights (that is the factor multiplied to the sparse contact duration)
-    for c in Contact_corrections: 
-        
-        #weight: factor of multiplication for contact duration
-        denom = compute_denom(c)
-        C_k[f'w_{c}'] = 1/denom
-        
-        #weight clipping for anomalous factors
-        W_cap = compute_weight_trim(C_k, f'w_{c}')
-        C_k[f'w_{c}_trim'] = C_k[f'w_{c}'].clip(upper = W_cap)
-
-    return coefs_dict
-
-
-def impute_undetected_contacts(C_k, h = 'hourofday_weekday', min_obs = 1): 
-    
-    C_k['date_hour'] = pd.to_datetime(C_k['date_hour'])
-    
-    # 1) compute observed contacts at the time-bucket h
-    C_k_observed_contacts = (
-        C_k.groupby(['u1', 'u2', h], as_index=False)
-          .size()
-          .rename(columns={'size': 'observed_contacts'})
-    )
-    C_k_observed_contacts = C_k_observed_contacts[C_k_observed_contacts['observed_contacts'] >= min_obs]
-    
-    H_ranges = pd.date_range(C_k['date_hour'].min(),
-                             C_k['date_hour'].max(), freq='h')
-    pairs = C_k[['u1','u2']].drop_duplicates()
-    hours = pd.DataFrame({'date_hour': H_ranges})
-    
-    C_imputed = pairs.merge(hours, how='cross')  # cartesian product
-    C_imputed = (C_imputed
-             .merge(C_k[['u1','u2','date_hour']], 
-                    on=['u1','u2','date_hour'], 
-                    how='left', indicator=True)
-             .query('_merge == "left_only"')
-             .drop('_merge', axis=1)
-    )
-    
-    C_imputed['n_minutes'] = 60
-    C_imputed['hour'] = pd.to_datetime(C_imputed['date_hour']).dt.hour
-    C_imputed['date'] = pd.to_datetime(C_imputed['date_hour']).dt.date
-    C_imputed['hourofday_weekday'] = gen_hw_col(C_imputed['date_hour'].values)
-    
-    C_imputed = C_imputed.merge(
-        C_k_observed_contacts[['u1', 'u2', 'hourofday_weekday']],
-        on=['u1', 'u2', 'hourofday_weekday'],
-        how='inner'
-    )
-    
-    C_k = pd.concat([C_k, C_imputed], axis = 0)
-    
-    return C_k
-
-def ipw_rescale_contacts(k, 
-                         USERS_select, 
-                         Date_range,
-                         rescaling = 'ipw_global', 
-                         return_contact_dataframe = False, 
-                         import_contact_weights = True):
-    '''
-    -rescaling
-        ipw_str = 'ipwt_global'
-        first part of the string defines the type of ipw
-         ipw   : basic
-         ipwt  : with trimmed weights
-         ipwt1h : clipping and trimming to 60 minutes)
-        second part of the string defines the contact-correction type
-    '''
-    
-    if import_contact_weights:
-        FOLD_save = '/home/fedde/work/Project_Penn/TMP/f01_015_D1_contacts_with_weights/'
-        C_k = pd.read_csv(FOLD_save + '_'.join([str(i) for i in k]) + '.csv', index_col = 0)
-    else:
-        #time-expensive
-        C_k, R_k = import_contacts_coverage(k, Date_range)
-        Contact_corrections = ['ipw_global', 'ipw_daily', 'ipw_hourofday_weekday']
-        Contact_corrections += [f'{c}_aligned' for c in Contact_corrections]
-        _ = compute_coefs(C_k, R_k, Contact_corrections) 
-    
-    ipw_type = rescaling.split('_')[0]
-    cc = '_'.join(rescaling.split('_')[1:])
-    wcol = f'w_{cc}'
-
-    if ipw_type == 'ipw':
-        #basic ipw
-        C_k['n_minutes'] *= C_k[f'w_ipw_{cc}']
-        
-    if ipw_type == 'ipwt': 
-        #ipw with trimmed coefficients
-        C_k['n_minutes'] *= C_k[f'w_ipw_{cc}_trim']
-        
-    if ipw_type == 'ipwt1h':
-        #ipw with trimmed coefficients
-        C_k['n_minutes'] *= C_k[f'w_ipw_{cc}_trim']
-        #rescaled date-hour duration is trimmed to 60 minutes
-        C_k['n_minutes'] = C_k['n_minutes'].clip(upper=60)
-
-    #trimmed inverse probabilistic weighiting plus imputation
-    if rescaling == 'ipwtplusimp_hourofday_weekday_minobs1':
-        wcol = 'w_ipw_hourofday_weekday'
-        W_cap = compute_weight_trim(C_k, wcol)
-        C_k[f'{wcol}_trim'] = C_k[wcol].clip(upper = W_cap)
-        C_k['n_minutes'] *= C_k[f'{wcol}_trim']
-        C_k['n_minutes'] = C_k['n_minutes'].clip(upper = 60)
-        C_k = impute_undetected_contacts(C_k, h = 'hourofday_weekday', min_obs=1)
-
-    #TRY: SET ALL CONTACT WEIGHTS TO 60 MINUTES
-    if rescaling == 'ipw_CU_60min':
-        print('rescaling 60 min')
-        C_k['n_minutes'] = 60
-        
-    #SET ALL CONTACT WEIGHTS TO 1440 MINUTES
-    if rescaling == 'CU_1440min':
-        C_k['n_minutes'] = 1440
-    
-    if return_contact_dataframe:
-        return C_k
-        
-    #[3] convert to a daily contact dataframe and clip to 1440 (max minutes in a day)
-    Contacts_k = gen_contact_daily(C_k, USERS_select)
-    Contacts_k = {k: c.clip(upper = 1440) for k,c in Contacts_k.items()}
-    
-    return Contacts_k
-
-#################################################################
-######### EVALUATE FEASIBILITY OF CONTACT CORRECTION  ###########
-#################################################################
-
-def compute_targets(C_k): 
-    '''
-    compute target of contact estimation in comparison to the ground truth
-    '''
-    _L_det =  lambda C_k : C_k[C_k['n_minutes'] > 0]
-    _L_udet =  lambda C_k : C_k[C_k['n_minutes'] == 0]
-    Links_det  = _L_det(C_k) 
-    Links_udet = _L_udet(C_k)
-    CV_det_k  = Links_det['n_minutes'].sum() 
-    CV_det_gt = Links_det['n_minutes_gt'].sum()
-    CV_udet_gt = Links_udet['n_minutes_gt'].sum()
-    CV_gt_tot = CV_det_gt + CV_udet_gt
-    
-    output_sr = pd.Series([len(Links_det), len(Links_det)+len(Links_udet), 
-                           CV_det_k, CV_det_gt, CV_udet_gt, CV_gt_tot], 
-                           index = ['nlinks_detected', 'nlinks_target', 
-                                    'CV_detected', 'CV_detected_target', 'CV_undetected_target','CV_tot_target'])
-
-    output_sr['nlinks_retention'] = output_sr['nlinks_detected']/output_sr['nlinks_target']
-    output_sr['CV_retention'] = output_sr['CV_detected']/output_sr['CV_tot_target']
-    output_sr['CV_loss_detected'] = (output_sr['CV_detected_target'] - output_sr['CV_detected'])/output_sr['CV_tot_target']
-    output_sr['CV_loss_undetected'] = output_sr['CV_undetected_target']/output_sr['CV_tot_target']
-    
-    return output_sr
-
-def compare_ipw_gt_weights(C_k, 
-                           bucket, 
-                           Date_range, 
-                           k):
-    '''
-    # Adjust the IPW capping threshold so that contact-duration correction 
-    # accounts only for the portion of duration loss assigned 
-    # to within-link underestimation (per Step 1’s decomposition).
-    # the adjustment must be done at the individual-couple level
-    # the adjustment requires a previous comparison of the weights and of the groundtruth weight
-    ''' 
-    
-    bucket_couple_targets = C_k.groupby(['u1','u2',bucket]).apply(lambda df: compute_targets(df))
-    
-    #COMPUTE THE IDEAL WEIGHT
-    BCT_det = bucket_couple_targets.query('nlinks_detected > 0')
-    BCT_det['w_gt'] = BCT_det['CV_detected_target']/BCT_det['CV_detected']
-    BCT_det = BCT_det.reset_index()
-    
-    #COMPUTE THE WEIGHTS DERIVED BY IPW ON COVERAGE
-    R_k = get_sparse_record_indicator(Date_range, k)
-    coefs_bucket = compute_coef_aligned_timebucket(R_k, bucket)
-    BCT_det['c1'] = BCT_det.apply(lambda row: coefs_bucket.loc[row[bucket]].loc[row['u1'], row['u1']], axis = 1)
-    BCT_det['c2'] = BCT_det.apply(lambda row: coefs_bucket.loc[row[bucket]].loc[row['u2'], row['u2']], axis = 1)
-    denom = BCT_det['c1'] * BCT_det['c2']
-    BCT_det['w_ipw'] = 1 / denom.replace(0, np.nan)
-    
-    return BCT_det
-
-###########################################
-######### ANALYSIS MISSINGNESS  ###########
-###########################################
-
-
-def gen_gap_lims(Seq):
-    '''
-    create gap list from a sequence
-    '''
-    Ind_gaps = Seq.diff() == -1
-    Ind_gaps_end = Seq.diff() == 1
-    Date_start_gaps = list(Ind_gaps[Ind_gaps.values].index)  # Convert to list to allow insertions
-    Date_end_gaps = list(Ind_gaps_end[Ind_gaps_end.values].index)  # Same for end gaps           
-    if Seq.iloc[0] == 0:
-        Date_start_gaps = [Seq.index[0]] + Date_start_gaps
-    if Seq.iloc[-1] == 0:
-        Date_end_gaps.append(Seq.index[-1])    
-    return [ (ds,de) for ds,de in zip(Date_start_gaps, Date_end_gaps) ]
-
-
-def gen_gaps_df(df_gaps):
-    '''
-    generate gap dataframe with information on starting hour and duration 
-    df_gaps : input matrix of record indicators
-    '''
-    
-    #gap dataframe indicator
-    df_gh = df_gaps.copy()
-    df_gh.columns = pd.to_datetime(df_gh.columns)
-
-    #adding a last column (1hours exceeding the time-range) to account for border gaps
-    last_col = df_gh.columns[-1]
-    last_col_plus1 = last_col + dt.timedelta(hours=1)
-    df_gh[last_col_plus1] = 1 
-
-    #generating the list of gaps for each sequence
-    df_gh['gaps'] = df_gh.apply(gen_gap_lims, axis=1)
-    df_gh['sequence_index'] = df_gaps.index
-    df_gh = df_gh[df_gh['gaps'].apply(len) > 0]
-    df_id_gaps = df_gh[['sequence_index', 'gaps']].explode(['gaps'])
-    df_id_gaps['start'] = df_id_gaps['gaps'].apply(lambda x : x[0])
-    df_id_gaps['gap_duration_hours'] =  df_id_gaps['gaps'].apply(lambda A : (A[1]-A[0]).total_seconds()/3600)
-    df_id_gaps = df_id_gaps[df_id_gaps['gap_duration_hours'] != 0]
-    df_id_gaps['start_hour'] = df_id_gaps['start'].dt.hour 
-    
-    return df_id_gaps.set_index('sequence_index')
-
-
-def filter_sequences(df_seq_ss):
-    '''
-    remove sequences which have a gap greater than 1 week (24*7 hours)
-    
-    '''
-    df_gap_ss = gen_gaps_df(df_seq_ss)
-    
-    df_gap_ss_max = df_gap_ss.groupby(level = 'sequence_index').agg({'gap_duration_hours':'max'}) 
-    
-    df_gap_ss_overmax = df_gap_ss_max[df_gap_ss_max['gap_duration_hours'] > 24*7]
-    
-    df_seq_ss = df_seq_ss[~df_seq_ss.index.isin(df_gap_ss_overmax.index)]
-
-    return df_seq_ss
-    
-#shuffle the gaps keeping the length
-def shuffle_gaps_keep_durations(row):
-    '''
-    shuffle gaps keeping their durations
-    '''
-    
-    # Step 1: Count runs of 0s and 1s
-    counts = [(k, sum(1 for _ in g)) for k, g in itertools.groupby(row)]
-    
-    # Step 2: Split into even and odd index blocks
-    c_even = counts[::2]
-    c_odds = counts[1::2]
-    
-    # Step 3: Shuffle both lists
-    np.random.shuffle(c_even)
-    np.random.shuffle(c_odds)
-
-    # Step 4: Randomize start
-    if np.random.rand() < 0.5:
-        first, second = c_even, c_odds
-    else:
-        first, second = c_odds, c_even
-
-    # Step 5: Alternate elements
-    count_shuffled = []
-    min_len = min(len(first), len(second))
-    for i in range(min_len):
-        count_shuffled.append(first[i])
-        count_shuffled.append(second[i])
-    
-    if len(first) > len(second):
-        count_shuffled.append(first[-1])
-    elif len(second) > len(first):
-        count_shuffled.append(second[-1])
-
-    # Step 6: Expand to full row
-    row_shuffled = [val for val, count in count_shuffled for _ in range(count)]
-    
-    return row_shuffled
-
-def add_feature_qrange(df_X):
-    '''
-    qrange is a feature 
-    '''
-    Q = (df_X ==0).sum(axis=1)/df_X.shape[1]
-    Q_ranges =  np.arange(0,1.1,0.1)
-    df_X['q_range'] = np.digitize(Q, Q_ranges)
-
-#compute the overall entropy
-def compute_entropy(df_gaps): 
-    '''
-    entropy computation over a dataframe of gaps
-    df_gaps: datasets containing the duration of each gap for each sequence in the dataframe
-    '''
-    from scipy.stats import entropy
-
-    col = 'gap_duration_hours'
-    m_vals = df_gaps[col].values
-    bins = np.arange(1, np.max(m_vals)+1)
-    freqs = np.histogram(m_vals,bins)[0]/len(m_vals)
-    return entropy(freqs)
-
-
 ###########################################
 ######### ANALYSIS CONTACTS  ###########
 ###########################################
+
 
 def contact_share(df,
                   s = 'Data driven',
@@ -3252,11 +1953,9 @@ def stats_missing_users(df,
     
     return df_slwp
 
-
 ###################################
 ######### ANALYSIS EMO  ###########
 ###################################
-
 
 def sem(x):
     """standard deviation of the mean (i.e., standard error)."""
@@ -3311,8 +2010,6 @@ def build_freq_table(
     )
     return df_freq
 
-from sklearn.metrics import r2_score
-
 def rsq(df, col1, col2, corr_type = 'pearson_r2'):
     if corr_type =='pearson_r2':
         return (df[col1].corr(df[col2]))
@@ -3365,8 +2062,6 @@ def map_values_to_bincoords(values, edges, fractional=True):
     else:
         out[m] = idx + 0.5
     return out
-
-
 
 def _filter_df(df, 
                s, 
@@ -3460,8 +2155,6 @@ def _heatmap_count(ax,
                                _plot = False, 
                                no_binning = False)
 
-
-
 def ax_colorbar_inset(ax):
 
     # clear axis
@@ -3504,9 +2197,2475 @@ def ax_colorbar_inset(ax):
     for label in cbar.ax.get_xticklabels():
         label.set_rotation(0)
 
+def visual_ax_dates(ax, 
+                     Dates, 
+                     visual_saturday = False, 
+                     tick_step = 1, 
+                     rot = 90, 
+                     axis = 'x', 
+                     date0 = False):
+    
+    Dates_md = pd.to_datetime(Dates).strftime("%-d %b")
+
+    Dates_ticks = Dates_md
+    if date0:
+        Dates_ticks = [Dates[0].date()] + list(Dates_md[1:])
+
+    if visual_saturday:
+        Dates_ticks = ['Sat ' + dt if d.weekday() == 5 else dt for dt, d in zip(Dates_ticks, Dates)]
+        for i,d in enumerate(Dates):
+            if d.weekday()==5:
+                ax.axvline(i, linewidth = .5, linestyle = '--', color = 'black')
+
+    xt = range(len(Dates))
+    ax_visual_ticklabel(ax, {'t': xt[::tick_step], 
+                             'tl': Dates_ticks[::tick_step],
+                             'rot': rot,
+                             'size': 10}, axis = axis)
+
+def _viz_sim_labels(ax, Date_range, title = '', ylabel = '', tick_step = 7):
+    '''
+    change datas and labels of simulation plot
+    '''
+    visual_ax_dates(ax, Date_range, tick_step = tick_step, rot = 45)
+    ax_visual_labeltitles(ax, 
+                          {'xlabel': 'Date', 
+                           'ylabel': ylabel,
+                           'title': title,
+                           'label_size': 15,
+                           'title_size': 20})
+
+def viz_single_sim(ax, 
+                   Single_sim, 
+                   linewidth = 2, 
+                   viz= 'CI', 
+                   color = 'grey', 
+                   scatter = 'false'):
+    '''
+    visualize single simulation
+    '''
+    
+    #cumulative infected
+    N_users = np.sum(Single_sim[0])
+    S = Single_sim[:,0]
+    CI = N_users - S
+    
+    #daily infected
+    I = Single_sim[:,1]   
+    
+    if viz =='CI':
+        ax.plot(CI, linestyle = '-', color = color, label = 'Cumulative Infected (CI)', 
+                linewidth = linewidth)
+    if viz =='I':
+        ax.plot(I, linestyle = '-', color = color, label = 'Infected (I)', 
+                linewidth= linewidth)
+
+def get_em_vals(DICT_EMO_metrics, k, em, N_users, norm = False):
+    '''
+    Import epidemic metric values
+    k  : scenario
+    em : epidemic metric
+    '''
+    ind_epid_metric = config.Emo_metrics_names.index(em)
+    if norm and em in ['peak_size', 'final_size']:
+        return 100*DICT_EMO_metrics[k][:,ind_epid_metric]/N_users
+    else:
+        return DICT_EMO_metrics[k][:,ind_epid_metric]
+
+def cumulative_infected(Single_sim):
+    '''
+    given Single_sim : daily time-series of Susceptibles and Infected
+    this function returns the Cumulative number of infected
+    '''
+    #cumulative infected
+    N_users = np.sum(Single_sim[0])
+    S = Single_sim[:,0]
+    CI = N_users - S
+    return CI 
+
+def get_max_indmax(Single_sim, curve = 'CI'):
+    '''
+    get maximum and index maximum for an epidemiologic curve
+    '''
+    if curve=='I':
+        #daily infected
+        I = Single_sim[:,1]
+        I_max = np.max(I)
+        I_max_ind = np.argwhere(I==I_max)[0,0]
+        return I_max, I_max_ind
+    if curve=='CI':
+        CI = cumulative_infected(Single_sim)
+        CI_max = np.max(CI)
+        CI_max_ind = np.argwhere(CI==CI_max)[0,0]
+        return CI_max, CI_max_ind
+
+def simulations_infected_v1(ax, 
+                            DICT_EMO,
+                            DICT_EMO_metrics,
+                            Date_range,
+                            k = 'Complete', 
+                            color = config.COLOR_GT, 
+                            box_x = 28, 
+                            _viz_single_sim = True, 
+                            viz = 'I',
+                            em = 'peak_size'):
+    
+    DICT_EMO_metrics_reduced = {k:v[:100] for k, v in DICT_EMO_metrics.items()}
+        
+    #simulation ensemble
+    Sims = DICT_EMO[k][1][:100]
+    #single simulation
+    Single_sim = Sims[0]
+    N_users = np.sum(Single_sim[0])
+    
+    #descriptive statistics of epidemiological outcome
+    CI_max, CI_max_ind = get_max_indmax(Single_sim , 'CI')
+    #ax.scatter(CI_max_ind, CI_max, marker = 'x', s = 30, color = 'blue', zorder = 10)
+    I_max, I_max_ind = get_max_indmax(Single_sim , 'I')
+    #ax.scatter(I_max_ind, I_max, marker = 'x', s = 30, color = 'blue', zorder = 10)
+
+    
+    for sim in Sims:
+        #Daily Infected
+        if _viz_single_sim:
+            viz_single_sim(ax, sim, linewidth=.1, color = color, viz = viz)
+            I_max, I_max_ind = get_max_indmax(sim , viz)
+            ax.scatter(I_max_ind, I_max, marker = 'x', s= 2, color = color)  
+            
+    _viz_sim_labels(ax, Date_range, ylabel = '')
+    
+    ax.set_ylabel('Infected', size = 15)
+    #ax.set_ylabel('Count', size = 15)
+    ax.set_xlim(0,30)
+    ax.axvline(27, color = 'black', linewidth = .5)
+    Is_max = get_em_vals(DICT_EMO_metrics_reduced, k, em, N_users)
+    Ms_ind = np.array([box_x]) 
+    
+    viz_scatter_boxplot(ax, 
+                        [Is_max], 
+                        Ms_ind,
+                        Colors = ['black'], 
+                        Colors_scatter = [color], 
+                        cbar = False)
+    
+    visual_ax_dates(ax, Date_range, tick_step = 7, rot = 45)
+    ax.set_xlabel('')
+    xticks = list(ax.get_xticks()) + [box_x]
+    xtick_labels = [tick.get_text() for tick in ax.get_xticklabels()] 
+    
+    if viz == 'I':
+        xtick_labels += ['Peak']
+    if viz == 'CI':
+        xtick_labels += ['Total']
+        
+    ax.set_xticks(xticks)
+    ax.set_xticklabels(xtick_labels)
+
+def axis_add_tick(ax,i):
+    # get existing ticks and labels
+    ticks = list(ax.get_yticks())
+    labels = [str(t) for t in ticks]
+
+    # add 0 if missing
+    if i not in ticks:
+        ticks.append(i)
+        labels.append(str(i))
+
+    # sort them together
+    ticks, labels = zip(*sorted(zip(ticks, labels)))
+
+    # apply
+    ax.set_yticks(ticks)
+    ax.set_yticklabels(labels)
+
+def remove_axis_ticktext(ax, axis='x'):
+    if axis == 'x':
+        ax.xaxis.set_major_formatter(NullFormatter())
+    elif axis == 'y':
+        ax.yaxis.set_major_formatter(NullFormatter())
+
+def set_leg_bbox(ax, 
+                 bx = 1.05, 
+                 by = 1):
+    
+    leg = ax.get_legend()
+    
+    if leg is not None:
+        leg.set_bbox_to_anchor((bx, by)) 
+
+def set_percent_yticks(ax, decimals=2, factor=100):
+    """Format current y-ticks as percentage strings."""
+    yticks = ax.get_yticks()
+    ax.set_yticks(yticks)
+    ax.set_yticklabels([f"{y*factor:.{decimals}f}" for y in yticks])
+
+def set_percent_xticks(ax, decimals=2, factor=100):
+    """Format current x-ticks as percentage strings."""
+    xticks = ax.get_xticks()
+    ax.set_xticks(xticks)
+    ax.set_xticklabels([f"{x*factor:.{decimals}f}" for x in xticks])
 
 
+#FUNCTION FOR CREATING DATA FOR VISUALIZATION
+def ax_visual_label(ax, DICT_label, legend_pars): 
+    Patches = [mpatches.Patch(color=l, label=c)  for c,l in DICT_label.items()]       
+    ax.legend(handles= Patches, 
+              loc = legend_pars['loc'], 
+              fontsize = legend_pars['fontsize'],
+              title_fontsize = legend_pars['title_fontsize'])
+
+def ax_visual_xticklabel(ax, DICT_xtl): 
+    xt, xtl, rot, size = (DICT_xtl[c] for c in ['xt', 'xtl','rot','size'])
+    ax.set_xticks(xt)
+    ax.set_xticklabels(xtl, rotation = rot, size = size)
+
+def ax_visual_yticklabel(ax, DICT_ytl): 
+    yt, ytl, rot, size = (DICT_ytl[c] for c in ['yt', 'ytl','rot','size'])
+    ax.set_yticks(yt)
+    ax.set_yticklabels(ytl, rotation = rot, size = size)
+
+def ax_visual_ticklabel(ax, DICT_xtl, axis='cx'): 
+    xt, xtl, rot, size = (DICT_xtl[c] for c in ['t', 'tl','rot','size'])
+    if axis=='x':
+        ax.set_xticks(xt)
+        ax.set_xticklabels(xtl, rotation = rot, size = size)
+    if axis=='y':
+        ax.set_yticks(xt)
+        ax.set_yticklabels(xtl, rotation = rot, size = size)   
+
+def ax_visual_labeltitles(ax, DICT_lt): 
+    xl = DICT_lt['xlabel']
+    yl = DICT_lt['ylabel']
+    title = DICT_lt['title']
+    size_l = DICT_lt['label_size']
+    size_t = DICT_lt['title_size']
+    ax.set_xlabel(xl, size = size_l)
+    ax.set_ylabel(yl, size = size_l)
+    ax.set_title(title, size = size_t)
+
+def ax_visual_legend(ax, 
+                     DICT_legend, 
+                     List_fc = None): 
+    
+    Colors = DICT_legend['colors']
+    Indicators = DICT_legend['classes']    
+    Patches = [mpatches.Patch(edgecolor = c, 
+                              facecolor= c, 
+                              label=l)  for c,l in zip(Colors, Indicators)]
+    if List_fc is not None:
+        Patches = [mpatches.Patch(label=l, 
+                                  edgecolor = c, 
+                                  facecolor=f)  for c,l,f in zip(Colors, Indicators, List_fc)]
+
+    ax.legend(handles = Patches, 
+              title   = DICT_legend['title'], 
+              loc            = DICT_legend['loc'], 
+              fontsize       = DICT_legend['fontsize'],
+              title_fontsize = DICT_legend['title_fontsize'])
+
+def gen_DICT_ax_visual(ax_viz = 'label_titles', 
+                       return_all = False):
+
+    DICT_ax_visual = {'label_ticks': {'t': '', 
+                                      'tl': '',
+                                      'rot': 90,
+                                      'size': 20},
+                      
+                      'label_titles': {'xlabel': '', 
+                                       'ylabel': '',
+                                       'title': '',
+                                       'label_size': 20,
+                                       'title_size': 25}, 
+                    
+                      'legend' : {'classes': [],
+                                  'colors': [], 
+                                  'title': '', 
+                                  'loc': 'upper left', 
+                                  'fontsize': 15, 
+                                  'title_fontsize': 15}}
+    
+    if return_all:
+        return DICT_ax_visual
+    
+    return DICT_ax_visual[ax_viz]
+
+def visual_imshow(ax, 
+                  df_tbr, 
+                  Colors, 
+                  legend_pars = None):
+    '''
+    legend_pars has keys: 'loc', 'fontsize', 'title_fontsize'
+    '''
+    
+    cmap = ListedColormap(Colors)  # 0 -> blue, 1 -> yellow
+    boundaries = np.arange(0,len(Colors)+1)-0.5   # Define boundaries that map values 1 -> blue, 2 -> red
+    norm = BoundaryNorm(boundaries, cmap.N)
+
+    ax.imshow(df_tbr, 
+               aspect='auto', 
+               cmap=cmap, 
+               norm = norm,
+               origin = 'lower', 
+               interpolation = None,
+               interpolation_stage='rgba')
+
+def get_temporal_ticks(Inds, 
+                       only_minute = True, 
+                       and_first_day_hour = False, 
+                       and_first_month_day = False):
+
+    #show bool of indexes
+    Inds_sb = Inds.minute == 0
+    if and_first_day_hour:
+        Inds_sb = Inds_sb & (Inds.hour == 0)
+    if and_first_month_day:
+        Inds_sb = Inds_sb & (Inds.day==1) 
+
+    return Inds, Inds_sb
+    
+def set_temporal_xticks(ax, 
+                        Inds, 
+                        Inds_sb,
+                        axis = 'x',
+                        str_format = '%Y-%m-%d %H'):
+
+    #tick's index
+    x_ti = np.arange(0,len(Inds))[Inds_sb]
+    #tick's vals 
+    x_tv = np.array(Inds)[Inds_sb]
+    if str_format is not None:
+        x_tv = pd.to_datetime(x_tv).strftime(str_format)
+    if axis=='y':
+        ax.set_yticks(x_ti,x_tv , rotation = 90, size = 15)
+    else:     
+        ax.set_xticks(x_ti,x_tv , rotation = 90, size = 15)   
+
+def plot_stacked_bar(df_count_, 
+                     Colors, 
+                     Labels, 
+                     xs = None, 
+                     x_nu = 0, 
+                     bar_width = 1, 
+                     legend=  False, 
+                     legend_loc= 'upper left', log_scale=  False): 
+    '''
+    plot a count-dataset as a stacked bar
+    '''
+    df_count = df_count_.copy()
+    
+    #getting the x-range 
+    Cols = df_count.columns 
+    x = range(len(Cols))
+    if xs is not None: 
+        x = xs 
+
+    x = [x_i + x_nu for x_i in x]
+    
+    #plotting the first count row 
+    r = 0
+    y_bottom = df_count.iloc[r].values
+    plt.bar(x, 
+            y_bottom,
+            color = Colors[r], 
+            label = Labels[r], 
+            width = bar_width)
+    
+    #plotting in order the subsequent count rows
+    for r in range(len(df_count))[1:]:
+        
+        y_up = df_count.iloc[r]
+        
+        plt.bar(x, 
+                y_up, 
+                bottom = y_bottom, 
+                color  = Colors[r],
+                label  = Labels[r], 
+                width  = bar_width)
+
+        y_bottom += y_up
+
+    if legend: 
+        plt.legend(loc = legend_loc, fontsize = 15)
+    if log_scale:
+        plt.yscale('log')
+
+def convert_num_colors(numbers):
+    # Choose a matplotlib colormap (e.g., 'viridis', 'plasma', 'inferno', etc.)
+    cmap = plt.get_cmap('viridis')
+    # Normalize the data to range between 0 and 1
+    from matplotlib.colors import LogNorm
+    norm = Normalize(vmin=min(numbers), vmax=max(numbers))
+    # Map the normalized data to colors using the colormap
+    colors = cmap(norm(numbers))
+
+    # Create a colorbar
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+
+    return colors, sm
+
+def gen_colors(num_colors):
+    # Generate a color map with the specified number of colors
+    cmap = plt.get_cmap('tab20')  # You can use 'tab10', 'tab20', 'Set3', or any other distinct colormap
+    colors = [cmap(i) for i in np.linspace(0, 1, num_colors)]
+    
+    return colors
+
+def map_nc(numbers, log = False, mm_set = None): 
+    
+    import matplotlib.colors as mcolors
+    # Create a colormap (e.g., 'viridis')
+    cmap = plt.get_cmap('viridis')
+    # Normalize the numbers to a range between 0 and 1
+    mm = (min(numbers), max(numbers))
+    if mm_set is not None:
+        mm = mm_set
+                    
+    norm = plt.Normalize(mm[0], mm[1])
+    if log: 
+        norm = mcolors.LogNorm(vmin = mm[0], 
+                               vmax = mm[1])
+        
+    # Map the numbers to colors using the colormap
+    colors = cmap(norm(numbers))
+    # Create a colorbar with the original range of values
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])  # Required for ScalarMappable
+    
+    return colors, sm
 
 
+############################################
+##### CONTACT -EPIDEMIC VISUALIZATION ######
+############################################
+
+
+#Define the function for visualizing each daily contact using ax object
+def visual_contact_daily(ax, df_cm0_, USERS_select, cbar=True):
+    df_cm0 = df_cm0_.pivot(index = 'u1', columns = 'u2', values = 'n_minutes').fillna(0).reindex(USERS_select,columns = USERS_select).fillna(0)
+    #df_cm0+=1e-6
+    cax = ax.matshow(df_cm0.values, 
+                     cmap=cm.jet, 
+                     #vmin=0, vmax=3600, 
+                     norm=LogNorm(vmin=1, vmax=3600),
+                     origin='lower', alpha=1.0)
+    if cbar:
+        cbar = plt.colorbar(cax, ax=ax, orientation='vertical', fraction=0.046, pad=0.1)
+        #cbar.set_ticks(np.arange(1, 3601, 120))
+        cbar.set_ticks([1, 60, 300, 600, 1800, 3600])  # Adjust tick values as needed
+        cbar.set_ticklabels([1, 60, 300, 600, 1800, 3600]) 
+        cbar.set_label('n_minutes', fontsize=  15)
+
+
+def visual_epid_count(ax, ts_SI, Dates, USERS_select):
+    ax.plot(Dates, ts_SI[:, 0][:-1], label='S', color='green')
+    ax.plot(Dates, ts_SI[:, 1][:-1], label='I', color='red')
+    ax.set_xticks(Dates)
+    ax.set_xticklabels(Dates, rotation=90)
+    ax.set_ylim(0, len(USERS_select))
+    ax.legend()
+
+def visual_R0(ax,ts_SI, Dates):
+    ax.plot(Dates, ts_SI[:, 2][:-1], color='blue')
+    ax.set_xticks(Dates)
+    ax.set_xticklabels(Dates, rotation=90)
+
+def visual_shaded_area(ax, x, x_minus, x_plus, color = 'blue', label = '', fill_btw = True, visual_line = True):
+    if visual_line:
+        ax.plot(x, color=color, label = label)
+    if fill_btw:
+        ax.fill_between(range(len(x)), x_minus, x_plus, color=color, alpha=0.2)
+
+def visual_curves_SI(ax, COLLECT_simulations, USERS_select, Dates):
+    q25, q50, q75 = np.percentile(COLLECT_simulations, [25, 50, 75], axis=0, method = 'nearest')
+    visual_shaded_area(ax, q50[:,0], q25[:,0], q75[:,0], color = 'green', label ='S')
+    visual_shaded_area(ax, q50[:,1], q25[:,1], q75[:,1], color = 'red', label ='I')
+    ax.set_xticks(range(len(Dates)), Dates)
+    ax.set_xticklabels(Dates, rotation=90)
+    ax.set_ylim(0, len(USERS_select))    
+    ax.set_ylabel('user count')
+    ax.legend()
+
+def visual_curves_SI_spectus(ax, 
+                             C_sims, 
+                             class_ = 'I',
+                             color = 'red', 
+                             legend = False, 
+                             fill_btw = True, 
+                             visual_median = True,
+                             visual_mean = False,
+                             visual_all_sims = False, 
+                             visual_saturday = False,
+                             alpha = 0.2):
+    '''
+    visualize the SI curves from spectus data
+    '''
+    
+    q25, q50, q75 = np.percentile(C_sims, 
+                                  [25, 50, 75], 
+                                  axis=0, 
+                                  method = 'nearest')
+    
+    if class_ == 'I':
+        visual_shaded_area(ax, 
+                           q50[:,1], q25[:,1], q75[:,1], 
+                           color = color, 
+                           fill_btw = fill_btw, visual_line = visual_median, alpha = alpha)
+    if class_ == 'S':
+        visual_shaded_area(ax, 
+                           q50[:,0], q25[:,0], q75[:,0], 
+                           color = color, 
+                           fill_btw = fill_btw, 
+                           visual_line = visual_median, alpha = alpha)
+
+    if visual_all_sims:
+        #print(f'yes {class_}')
+        for c in C_sims:
+            if class_ == 'I':
+                ax.plot(c[:,1], color = color, linewidth = .1)
+            if class_ == 'S':
+                ax.plot(c[:,0], color = color, linewidth = .1)
+            if class_ == 'I_tot':
+                N_tot = np.sum(c[0])
+                ax.plot(N_tot - c[:,0], color = color, linewidth = .1)
+
+
+    if visual_mean:
+        if class_ == 'I':
+            ax.plot(np.mean(C_sims[:,:,1], axis = 0), color = color, linewidth = 2, linestyle = '--')
+        if class_ == 'S':
+            ax.plot(np.mean(C_sims[:,:,0], axis = 0), color = color, linewidth = 2, linestyle = '--')
+        
+    #ax.set_ylabel(f'user count', size = 20)
+    if legend:
+        ax.legend()
+
+def visual_curves_R0(ax, COLLECT_simulations, Dates):
+    q25, q50, q75 = np.percentile(COLLECT_simulations, [25, 50, 75], axis=0, method = 'nearest')
+    visual_shaded_area(ax, q50[:,2], q25[:,2], q75[:,2], color = 'blue', label ='R0')
+    ax.set_xticks(range(len(Dates)), Dates)
+    ax.set_xticklabels(Dates, rotation=90)
+    ax.legend()
+
+def visual_epid_simulation(axes, COLLECT_simulations, Dates):
+    '''
+    visualize iterated epidemiological simulation
+    '''    
+    visual_curves_SI(axes[0], COLLECT_simulations, Dates)
+    visual_curves_R0(axes[1], COLLECT_simulations, Dates)
+
+def ax_legend_level(ax, 
+                    loc = 'lower left', 
+                    fontsize = 10,
+                    include_complete = True):
+    
+    Classes = ['ground truth'] + [convert_to_percent_range(str(l)) for l in Levels]       
+    Colors  = ['blue']     + [DICT_colors_level[l] for l in Levels]
+
+    if not include_complete:
+        Classes = Classes[1:]
+        Colors = Colors[1:]    
+    
+    DICT_legend = gen_DICT_ax_visual('legend')
+    DICT_legend.update({'classes': Classes, 
+                        'colors': Colors, 
+                        'loc': loc, 
+                        'fontsize':10})
+    
+    ax_visual_legend(ax, DICT_legend)
+
+def ax_legend_sparsification(ax, 
+                             loc = 'upper right', 
+                             fontsize = 10, 
+                             include_complete = True):
+
+    Classes = ['ground truth'] + [DICT_rename_ss_brief[s] for s in List_ss] 
+    Colors  = ['blue']     + [DICT_colors_ss[s] for s in List_ss]      
+    if not include_complete:
+        Classes = Classes[1:]
+        Colors = Colors[1:]  
+        
+    DICT_legend = gen_DICT_ax_visual('legend')
+    DICT_legend.update({'classes': Classes,
+                        'colors': Colors, 
+                        'title': '', 
+                        'loc': loc, 
+                        'fontsize':fontsize})
+    ax_visual_legend(ax, DICT_legend)
+
+def ax_legend_emv(ax, 
+                  EMVs, 
+                  loc = 'upper right', 
+                  fontsize = 10, 
+                  title_fontsize = 10,
+                  title= '',
+                  include_complete = True):
+
+    Classes = ['ground truth'] +  [DICT_rename_EMVs[s] for s in EMVs]
+    Colors  = ['blue'] +      [DICT_colors_emv[s] for s in EMVs]  
+    if not include_complete:
+        Classes = Classes[1:]
+        Colors = Colors[1:]  
+                                 
+    DICT_legend = gen_DICT_ax_visual('legend')
+    DICT_legend.update({'classes': Classes,
+                        'colors': Colors, 
+                        'title': title, 
+                        'loc': loc, 
+                        'fontsize':fontsize,
+                        'title_fontsize': title_fontsize})
+    ax_visual_legend(ax, DICT_legend)
+
+def ax_visual_line_legend(ax, DICT_legend):
+    
+    Colors = DICT_legend['colors']
+    Indicators = DICT_legend['classes']
+    LineStyles = DICT_legend.get('linestyles', ['solid'] * len(Colors))  # Default to solid if not specified
+
+    Patches = [mlines.Line2D([], [], color=c, linestyle=ls, label=l, linewidth=2) 
+               for c, l, ls in zip(Colors, Indicators, LineStyles)]
+
+    ax.legend(handles=Patches, 
+              title=DICT_legend['title'],
+              loc=DICT_legend['loc'], 
+              fontsize=DICT_legend['fontsize'],
+              title_fontsize=DICT_legend['title_fontsize'])
+
+def scatter_df(ax, 
+               df, x, y, 
+               title = '', 
+               s = 1,
+               c = 'blue',
+               x_rename = None, 
+               y_rename = None, 
+               label_size =  15,
+               title_size = 20,
+               cmap = None,
+               vmin = None,
+               vmax = None, 
+               colorbar = False, 
+               colorbar_label = ''): 
+    
+    X = df[x].values
+    Y = df[y].values
+    
+    sc = ax.scatter(X, Y,  
+                    c = c, 
+                    s = s, 
+                    cmap = cmap,
+                    vmin = vmin, 
+                    vmax = vmax)
+
+    if colorbar:
+        cbar = plt.colorbar(sc, ax = ax)
+        cbar.set_label(colorbar_label)
+        
+    if x_rename is None:
+        x_rename = x
+    if y_rename is None:
+        y_rename = y
+
+    ax_visual_labeltitles(ax, {'xlabel': x_rename, 
+                               'ylabel': y_rename,
+                               'title': title, 
+                               'label_size': label_size, 
+                               'title_size': title_size})
+    
+
+def rescale_ax_ticks(ax, 
+                     int_scale = 4, 
+                     digit_round = 0, 
+                     scient_not_drop = False, 
+                     axis = 'x'):
+    '''
+    scient_not_drop: drop scientific notation if already rescaled and put it into 
+    else rescale the ticks accordingly
+    '''
+
+    if scient_not_drop:
+        if axis=='y':
+            ax.yaxis.offsetText.set_visible(False)
+            ylabel = ax.get_ylabel()
+            ax.set_ylabel(f"{ylabel} $(x10^{int_scale})$")
+        if axis=='x':
+            ax.xaxis.offsetText.set_visible(False)
+            xlabel = ax.get_xlabel()
+            ax.set_xlabel(f"{xlabel} $(x10^{int_scale})$")
+        
+    else:
+        if axis=='y':
+            yticks = ax.get_yticks()
+            yticks_rescaled = [f'{np.round(y/(10**int_scale),digit_round)}' for y in yticks]
+            ax.set_yticklabels(yticks_rescaled)
+            ylabel = ax.get_ylabel()
+            ax.set_ylabel(f"{ylabel} $(x10^{int_scale})$")
+        if axis=='x': 
+            xticks = ax.get_xticks()
+            xticks_rescaled = [f'{np.round(x/(10**int_scale),digit_round)}' for x in xticks]
+            ax.set_xticklabels(xticks_rescaled)
+            xlabel = ax.get_xlabel()
+            ax.set_xlabel(f"{xlabel} $(x10^{int_scale})$")
+
+
+#Visualize scatterplot and boxplot together
+def viz_scatter_boxplot(ax,
+                        List_Ms, 
+                        Ms_ind,
+                        Colors, 
+                        Colors_scatter = 'black',
+                        vmin = 0, 
+                        vmax = 15, 
+                        cmap = 'viridis',
+                        cbar = True,
+                        cbar_label = '',
+                        scatter_size = 1):
+    '''
+    Visualize the boxplots of a list of values in List_Ms corresponding to indexes Ms_ind,
+    Colors are the colors of the boxplots
+    Colors_scatter are the colors of the scatter points (can be also a list)
+        cmap : of the Colors_scatter
+    '''
+
+    for i, c, Ms in zip(Ms_ind, Colors, List_Ms):
+        
+        ax.boxplot(Ms, 
+                   positions = [i], 
+                   widths = 0.5, 
+                   showfliers = False, 
+                   patch_artist=True,
+                   boxprops=dict(facecolor= 'none', color= c),
+                   capprops=dict(color=c),
+                   whiskerprops=dict(color=c),
+                   flierprops=dict(color=c, markeredgecolor=c),
+                   medianprops=dict(color=c))
+
+        X_vals = [i + np.random.normal(scale = 0.05) for j in range(len(Ms))]
+        if len(Colors_scatter)>1:
+            IND = np.argwhere(Ms_ind==i)[0][0]
+            sc = ax.scatter(X_vals, 
+                            Ms, 
+                            c = Colors_scatter[IND],
+                            vmin = vmin, vmax = vmax, cmap = cmap, 
+                            s = scatter_size)
+            if cbar and IND==0:
+                cbar = plt.colorbar(sc, ax=ax)
+                cbar.set_label(cbar_label, size=14)
+            
+        else:
+            ax.scatter(X_vals, 
+                       Ms, 
+                       color = Colors_scatter, 
+                       s = scatter_size)
+
+def change_first_xtick(ax, newlabel='newlabel'):
+    xticks = ax.get_xticks()  # Get current x-tick positions
+    xticklabels = ax.get_xticklabels()  # Get current x-tick labels
+    ax.set_xticks(xticks)  # Update x-ticks
+    xticklabels[0] = newlabel  # Modify first tick label
+    ax.set_xticklabels(xticklabels)  # Update x-tick labels
+
+#Visualize scatterplot and boxplot together
+def viz_scatter_boxplot_new(ax,
+                            List_Ms, 
+                            Ms_ind,
+                            Colors = 'black', 
+                            Colors_scatter = 'black',
+                            scatter = True,
+                            scatter_size = 1, 
+                            x_Labels = None, 
+                            x_label_size = 0,
+                            x_label_rot = 0):
+    '''
+    Visualize the boxplots of a list of values in List_Ms corresponding to indexes Ms_ind
+    Colors are the colors of the boxplots
+    Colors_scatter are the colors of the scatter points (can be also a list)
+        cmap : of the Colors_scatter
+    '''
+    
+    if not isinstance(Colors, list):
+        Colors = [Colors] * len(List_Ms)
+    if not isinstance(Colors_scatter, list):
+        Colors_scatter = [Colors_scatter] * len(List_Ms)
+
+    for i, Ms, c, c_scatter in zip(Ms_ind, 
+                                   List_Ms, 
+                                   Colors, 
+                                   Colors_scatter):
+        
+        ax.boxplot(Ms, 
+                   positions = [i], 
+                   widths = 0.5, 
+                   showfliers = False, 
+                   patch_artist = True,
+                   boxprops = dict(facecolor = 'none', color = c),
+                   capprops = dict(color=c),
+                   whiskerprops = dict(color=c),
+                   flierprops = dict(color=c, markeredgecolor=c),
+                   medianprops = dict(color=c))
+
+        #add scatter points within the boxplot
+        if scatter:
+            X_vals = [i + np.random.normal(scale = 0.05) for j in range(len(Ms))]
+            ax.scatter(X_vals, 
+                       Ms, 
+                       color = c_scatter, 
+                       s = scatter_size)
+            
+    if x_Labels is not None: 
+        ax_visual_ticklabel(ax, {'t': Ms_ind, 
+                                 'tl': x_Labels,
+                                 'rot': x_label_rot,
+                                 'size': x_label_size}, axis = 'x')
+
+def viz_bar_series(ax, 
+                   s, 
+                   s_ind = None, 
+                   Colors = 'black',
+                   x_Labels= None, 
+                   x_label_rot=0,
+                   x_label_size=10):
+    '''
+    visual a series values with an ax.bar plot with customized colors and labeling
+    s: series
+    s_ind : x-ticks of bar plots
+    Colors : can be also a list equal to the length of the series
+    '''
+
+    if not isinstance(Colors, list):
+        Colors = [Colors] * len(s)
+        
+    if x_Labels is not None:
+        s = s.loc[x_Labels]
+    else:
+        x_Labels = s.index
+        
+    if s_ind is None:
+        s_ind = range(len(s))
+        
+    for i,val,c in zip(s_ind, s.values, Colors):
+        ax.bar([i], val, color = c)
+        
+    ax_visual_ticklabel(ax, {'t': s_ind, 
+                             'tl': x_Labels,
+                             'rot': x_label_rot,
+                             'size': x_label_size}, axis = 'x')
+
+def custom_boxplot_from_stats(ax, 
+                              stats, 
+                              positions=None, 
+                              color='black', 
+                              width=.8, 
+                              linewidth=1,
+                              face_alpha=1,
+                              median_color='black',
+                              bar_as_median=False,
+                              bar_errorbar = True, 
+                              capsize = 1):
+    """
+    Draw a boxplot (default) or a barplot-with-errorbars (if bar_as_median=True)
+    given precomputed stats (dicts with q1, q3, med, whislo, whishi).
+
+    color: str or list[str] — single color for all boxes or one per box.
+    median_color: str — color for median lines (default 'black').
+    bar_as_median: bool — if True, plot median as bar height with CI error bars instead of a box.
+    """
+    
+    n = len(stats)
+    if positions is None:
+        positions = list(range(1, n+1))
+
+    # normalize color input
+    if isinstance(color, (list, tuple)):
+        if len(color) != n:
+            raise ValueError("If 'color' is a list, its length must equal len(stats).")
+        colors = list(color)
+    else:
+        colors = [color] * n
+
+    if bar_as_median:
+        # Draw bars at median with error bars from whislo/whishi
+        medians = [s['med'] for s in stats]
+        err_low = [s['med'] - s['whislo'] for s in stats]
+        err_high = [s['whishi'] - s['med'] for s in stats]
+        ax.bar(positions, medians,
+               color=colors,
+               alpha=face_alpha,
+               width=width,
+               edgecolor='none',
+               zorder=2)
+        if bar_errorbar:
+            ax.errorbar(positions, medians,
+                        yerr=[err_low, err_high],
+                        fmt='none',
+                        ecolor=median_color,
+                        elinewidth=linewidth,
+                        capsize=capsize,
+                        zorder=3)
+        
+        return None  # nothing to return in this mode
+
+    # --- default boxplot branch ---
+    bp = ax.bxp(stats,
+                positions=positions,
+                widths=width,
+                patch_artist=True,
+                showfliers=False)
+
+    for i in range(n):
+        c = colors[i]
+        bp['boxes'][i].set(facecolor=c, edgecolor=c, linewidth=linewidth, alpha=face_alpha)
+        bp['medians'][i].set(color=median_color, linewidth=linewidth)
+        #if i < len(bp['fliers']):
+        #    bp['fliers'][i].set(marker='o', color=c, alpha=0.7)
+
+        wi0, wi1 = 2*i, 2*i + 1
+        bp['whiskers'][wi0].set(color=c, linewidth=linewidth)
+        bp['whiskers'][wi1].set(color=c, linewidth=linewidth)
+        bp['caps'][wi0].set(color=c, linewidth=linewidth)
+        bp['caps'][wi1].set(color=c, linewidth=linewidth)
+
+    return bp
+
+def caret_marker(direction = "up", 
+                 width = 1.0, 
+                 height = 1.0):
+    """
+    Symmetric triangular caret centered at (0,0).
+    direction: "up" or "down"
+    width, height: relative shape proportions.
+    """
+    w = 0.9 * width
+    h = 0.9 * height
+    verts = np.array([
+        [ 0.0,  h/2],   # tip
+        [-w/2, -h/2],   # left base
+        [ w/2, -h/2],   # right base
+        [ 0.0,  0.0],   # ignored for CLOSEPOLY
+    ])
+    if direction == "down":
+        verts[:, 1] *= -1
+    codes = [Path.MOVETO, Path.LINETO, Path.LINETO, Path.CLOSEPOLY]
+    return MarkerStyle(Path(verts, codes))
+
+def visual_metric(ax, 
+                  df_stats, 
+                  metric, 
+                  List_ss,
+                  X,
+                  *,
+                  gt_tick = [0],
+                  DICT_colors_ss = config.DICT_colors_ss,
+                  COLOR_GT_std = 'black', #config.COLOR_GT,
+                  col_gt = 'Complete',
+                  visual_bxp_groundtruth=True,
+                  visual_std_groundtruth=True,
+                  visual_mean=True,
+                  visual_mean_std=False,
+                  visual_bxp=True,
+                  set_yax_percent=False,
+                  # --- NEW ---
+                  color_mean_std='black',          # can be str or list per-level
+                  mean_marker_size=5,
+                  cap_std_marker_size=8,
+                  err_linewidth=1.2, 
+                  marker_std_up = caret_marker('up'),
+                  marker_std_down = caret_marker('down'),
+                  xtl_noperc = False,
+                  face_alpha = 1, 
+                  linewidth =1,
+                  capsize=1,
+                  bar_as_median = False,
+                  bar_errorbar_gt = True):
+    """
+    df_stats must have as index [s, l]; sparsity and sparsity level 
+    when analyzing debiasing it should be [emv, l] : debiasing approach and sparsity level
+    
+    Visualize boxplots and/or mean (+/- std) for each sparsity model in List_ss.
+
+    Colors:
+      - DICT_colors_ss[s] can be a single color or a list of colors (len == len(Levels)).
+      - color_mean_std can also be a single color or a list per-level. If None, it follows DICT_colors_ss[s].
+    """
+    # standard matplotlib naming of stats for IQR and CI
+    bxp_stats = ['whislo', 'q1', 'med', 'q3', 'whishi']
+    
+    # groundtruth stats
+    s_bxp_gt = [{stat: df_stats.loc[col_gt, col_gt][f'{metric}_{stat}']
+                 for stat in bxp_stats}]
+    s_bxp_gt[0].update({'fliers': []})
+    
+    s_mean_gt = [df_stats.loc[col_gt, col_gt][f'{metric}_mean']]
+    s_std_gt  = [df_stats.loc[col_gt, col_gt][f'{metric}_std']]
+
+    Levels = config.Levels
+    n_levels = len(Levels)
+
+    def _normalize_colors(c):
+        """Return a list of length n_levels from a color or color list."""
+        if isinstance(c, (list, tuple)):
+            if len(c) != n_levels:
+                raise ValueError(f"Color list must match len(Levels)={n_levels}")
+            return list(c)
+        else:
+            return [c] * n_levels
+
+    for j, s in enumerate(List_ss):
+        print(s)
+        # base color(s) for this sparsity model
+        base_color = DICT_colors_ss[s]
+        print(base_color)
+        colors_levels = _normalize_colors(base_color)
+
+        # mean/std colors per level (follow base if None; else normalize)
+        if color_mean_std is None:
+            ms_colors = colors_levels
+        else:
+            ms_colors = _normalize_colors(color_mean_std)
+
+        # [0] gather stats per level
+        s_bxp = [{k: df_stats.loc[s, str(l)][f'{metric}_{k}'] for k in bxp_stats}
+                 for l in Levels]
+        for d in s_bxp:
+            d.update({'fliers': []})
+
+        # [1] boxplots (support per-level colors)
+        if visual_bxp:
+            custom_boxplot_from_stats(ax,
+                                      s_bxp,
+                                      positions=X + j,
+                                      color=colors_levels, 
+                                      face_alpha = face_alpha, 
+                                      bar_as_median = bar_as_median,
+                                      capsize=capsize, 
+                                      linewidth = linewidth) # <-- list or single OK
+            
+            # median ground-truth line
+            gt_median = df_stats.loc[col_gt, col_gt][f'{metric}_med']
+            ax.axhline(gt_median, color=config.COLOR_GT, linewidth=.5)
+
+        if visual_bxp_groundtruth:
+            custom_boxplot_from_stats(ax,
+                                      s_bxp_gt,
+                                      positions=[0],
+                                      color=config.COLOR_GT,
+                                      capsize=capsize, 
+                                      linewidth = linewidth,
+                                      bar_as_median = bar_as_median,
+                                      bar_errorbar = bar_errorbar_gt)
+
+        # [2] mean and std
+        if visual_mean or visual_mean_std:
+            s_mean = [df_stats.loc[s, str(l)][f'{metric}_mean'] for l in Levels]
+            s_std  = [df_stats.loc[s, str(l)][f'{metric}_std']  for l in Levels]
+            x_pos  = np.full(n_levels, X + j, dtype=float)
+
+        
+        
+        if visual_mean:
+            # per-level mean markers
+            for xi, yi, c in zip(x_pos, s_mean, ms_colors):
+                ax.scatter(xi, yi, color = c, s = mean_marker_size, marker='o', zorder=3)
+
+            # ground truth mean
+            ax.scatter(gt_tick, s_mean_gt, color=COLOR_GT_std, s=mean_marker_size, marker='o', zorder=3)
+
+            if visual_std_groundtruth:
+                # GT std line + caret caps
+                ax.errorbar(gt_tick,
+                            s_mean_gt,
+                            yerr=s_std_gt,
+                            fmt='none', ecolor=COLOR_GT_std,
+                            elinewidth = err_linewidth, capsize=0, zorder=2)
+                
+                ax.scatter(gt_tick, [s_mean_gt[0] + s_std_gt[0]],
+                           marker= marker_std_up,   color=COLOR_GT_std,
+                           s=cap_std_marker_size, zorder=4)
+                ax.scatter(gt_tick, [s_mean_gt[0] - s_std_gt[0]],
+                           marker= marker_std_down, color=COLOR_GT_std,
+                           s=cap_std_marker_size, zorder=4)
+
+        if visual_mean_std:
+            # loop per level so each errorbar uses its own color
+            for xi, yi, si, c in zip(x_pos, s_mean, s_std, ms_colors):
+                ax.errorbar([xi], [yi], yerr=[si],
+                            fmt='none', ecolor=c,
+                            elinewidth=err_linewidth, capsize=0, zorder=2)
+                ax.scatter(xi, yi + si, marker = marker_std_up,
+                           color=c, s=cap_std_marker_size, zorder=4)
+                ax.scatter(xi, yi - si, marker = marker_std_down,
+                           color=c, s=cap_std_marker_size, zorder=4)
+
+    # x-ticks
+    DICT_xtl = gen_DICT_ax_visual('label_ticks')
+    DICT_xtl['t']  = [0] + list(X)
+    xtl = ['0-5'] + config.Levels_str
+    
+    if xtl_noperc:
+        xtl = [x[:-1] for x in xtl]
+        
+    DICT_xtl['tl'] = xtl
+    DICT_xtl['rot'] = 45
+    ax_visual_ticklabel(ax, DICT_xtl, axis='x')
+
+    # y ticks as percents
+    if set_yax_percent:
+        DICT_ytl = gen_DICT_ax_visual('label_ticks')
+        yticks = ax.get_yticks()
+        yticks = yticks[(yticks >= 0) & (yticks <= 1)]
+        DICT_ytl['t']  = yticks
+        DICT_ytl['tl'] = (yticks * 100).astype(int)
+        DICT_ytl['rot'] = 0
+        ax_visual_ticklabel(ax, DICT_ytl, axis='y')
+
+def restyle_ax(ax,
+               title_size =        config.ax_title_size,
+               label_size =        config.ax_label_size,
+               text_size  =        config.ax_text_size,
+               tick_size  =        config.ax_tick_size,
+               legend_font_size  = config.ax_legend_font_size,
+               legend_title_size = config.ax_legend_title_size,               
+               font_family='Liberation Sans', 
+               other_text = True):
+    """
+    Apply consistent font sizes and font family to ticks, labels, title, legend, and texts in an Axes.
+    """
+
+    # Axis labels
+    ax.xaxis.label.set_size(label_size)
+    ax.xaxis.label.set_family(font_family)
+    ax.yaxis.label.set_size(label_size)
+    ax.yaxis.label.set_family(font_family)
+
+    # Title
+    ax.title.set_size(title_size)
+    ax.title.set_family(font_family)
+
+    # Tick labels
+    ax.tick_params(axis='both', which='major', labelsize=tick_size)
+    for tick in ax.get_xticklabels() + ax.get_yticklabels():
+        tick.set_fontsize(tick_size)
+        tick.set_family(font_family)
+
+    # Legend
+    legend = ax.get_legend()
+    if legend:
+        legend.get_title().set_fontsize(legend_title_size)
+        legend.get_title().set_family(font_family)
+        for text in legend.get_texts():
+            text.set_fontsize(legend_font_size)
+            text.set_family(font_family)
+    if other_text:
+        # Other text
+        for text in ax.texts:
+            text.set_fontsize(text_size)
+            text.set_family(font_family)
+
+#####################
+#### RIDGEPLOTS #####
+#####################
+
+#histogram creation function
+def compute_discrete_ridge_data(
+    df,
+    by,
+    column,
+    bins,
+    normalize = 'max'):
+    
+    groups = list(df[by].dropna().unique())
+    H = []
+    for g in groups:
+        h, _ = np.histogram(df.loc[df[by] == g, column], bins=bins)
+        H.append(h.astype(float))
+        
+    H = np.vstack(H)
+    widths = np.diff(bins)
+    
+    if normalize == 'density':
+        H = (H / H.sum(1, keepdims=True)) / widths
+    elif normalize == 'max':
+        m = H.max()
+        if m > 0:
+            H = H / m
+    x = (bins[:-1] + bins[1:]) / 2
+    
+    return x, H, groups
+
+def plot_discrete_ridges(ax,
+                         x,
+                         H,
+                         groups = None,
+                         overlap = 1.4,
+                         alpha = 0.55,
+                         color = cm.Blues,        # can be str, list, or colormap
+                         linewidth = 1.0,
+                         show_labels = True,
+                         mask = None,             # boolean list/array of len(groups)
+                         x_label = 0,
+                         labels = None,           # NEW: list/array of custom labels per group
+                         label_rotation = 0,      # NEW: rotation (deg)
+                         label_size = 10):        # NEW: fontsize
+
+    spacing = 1.0 / overlap
+
+    if groups is None:
+        groups = list(range(len(H)))
+
+    if mask is None:
+        mask = [True] * len(groups)
+    elif len(mask) != len(groups):
+        raise ValueError("`mask` must have same length as groups")
+
+    if isinstance(color, str):
+        colors = [color] * len(groups)
+    elif hasattr(color, "__call__"):
+        colors = [color(i / max(1, len(groups)-1)) for i in range(len(groups))]
+    elif isinstance(color, (list, tuple)) and len(color) == len(groups):
+        colors = color
+    else:
+        raise ValueError("`color` must be a string, colormap, or list of len(groups).")
+
+    n = len(groups)
+    for idx in range(n - 1, -1, -1):
+        g    = groups[idx]
+        h    = H[idx]
+        c    = colors[idx]
+        keep = mask[idx]
+        y0 = idx * spacing
+        ridge_alpha = alpha if keep else 0.0
+
+        x = np.asarray(x)
+        w = np.median(np.diff(x)) if len(x) > 1 else 1.0
+        edges = np.concatenate([x - w/2, [x[-1] + w/2]])
+        h_ext = np.concatenate([h, [h[-1]]])
+
+        if keep:
+            ax.axhline(y0, color='black', lw=0.5, zorder=0)
+
+        ax.fill_between(
+            edges, y0, y0 + h_ext,
+            step='post', alpha=ridge_alpha,
+            facecolor=c, edgecolor='black', zorder=1
+        )
+
+        ax.plot(
+            edges, y0 + h_ext,
+            drawstyle='steps-post', color='black',
+            lw=linewidth, alpha=ridge_alpha, zorder=2
+        )
+
+        # --- generalized label block ---
+        if keep and show_labels:
+            txt = (labels[idx] if (labels is not None and len(labels) == n)
+                   else str(g))
+            ax.text(
+                x_label, y0, txt,
+                va='center', ha='right',
+                rotation=label_rotation,
+                fontsize=label_size,
+                zorder=3
+            )
+
+def discrete_ridge_hist(
+    ax,
+    df,
+    by,
+    column,
+    bins,
+    overlap=1.4,
+    alpha=0.55,
+    color=cm.Blues,
+    normalize='max',
+    linewidth=1.0,
+    show_labels = False,
+    x_label = 0,
+    labels = None,           # NEW: list/array of custom labels per group
+    label_rotation = 0,      # NEW: rotation (deg)
+    label_size = 10):        # NEW: fontsize
+
+    x, H, groups = compute_discrete_ridge_data(
+        df=df,
+        by=by,
+        column=column,
+        bins=bins,
+        normalize=normalize
+    )
+    plot_discrete_ridges(
+        ax=ax,
+        x=x,
+        H=H,
+        groups=groups,
+        overlap=overlap,
+        alpha=alpha,
+        color=color,
+        linewidth=linewidth,
+        show_labels=show_labels,
+        x_label = x_label,
+        labels = labels,           # NEW: list/array of custom labels per group
+        label_rotation = label_rotation,      # NEW: rotation (deg)
+        label_size = label_size)        # NEW: fontsize
+    
+def plot_level_ridges(
+    df_freq,
+    ax,
+    l,
+    ss=None,                    # list of scenario keys (defaults to global _ss if present)
+    x=None,                     # x positions; defaults to range over df_freq columns
+    overlap=4,
+    alpha=0.8,
+    color=None,
+    linewidth=1,
+    show_labels=False,
+    x_label=0,
+    mask=None,
+    labels=None,                # custom labels per ridge (len == len(ss))
+    label_rotation=0,
+    label_size=10):
+    if ss is None:
+        ss = _ss  # fallback to existing global if user keeps it
+    if x is None:
+        x = range(df_freq.shape[1])
+
+    H_l = [df_freq.loc[(s, str(l))].values for s in ss]
+
+    plot_discrete_ridges(
+        ax=ax,
+        x=x,
+        H=H_l,
+        groups=ss,
+        overlap=overlap,
+        alpha=alpha,
+        color=color,
+        linewidth=linewidth,
+        show_labels=show_labels,
+        x_label=x_label,
+        mask=mask,
+        labels=labels,
+        label_rotation=label_rotation,
+        label_size=label_size
+    )
+
+def plot_missingness_ridges(
+    df_freq,
+    ax,
+    s,
+    levels=None,                # list/iterable of Levels (defaults to global Levels if present)
+    x=None,
+    overlap=4,
+    alpha=0.8,
+    color=None,
+    linewidth=1,
+    show_labels=False,
+    x_label=0,
+    mask=None,
+    labels=None,                # custom labels per level (len == len(levels))
+    label_rotation=0,
+    label_size=10):
+    
+    if levels is None:
+        levels = config.Levels  # fallback to existing global if user keeps it
+    if x is None:
+        x = range(df_freq.shape[1])
+
+    H_l = [df_freq.loc[(s, str(l))].values for l in levels]
+
+    plot_discrete_ridges(
+        ax=ax,
+        x=x,
+        H=H_l,
+        groups=[str(l) for l in levels],
+        overlap=overlap,
+        alpha=alpha,
+        color=color,
+        linewidth=linewidth,
+        show_labels=show_labels,
+        x_label=x_label,
+        mask=mask,
+        labels=labels,
+        label_rotation=label_rotation,
+        label_size=label_size
+    )
+
+def plot_groundtruth_ridges(
+    df_freq,
+    ax,
+    groundtruth=('Complete', 'Complete'),
+    k=3,                        # number of repeated ridges (ignored if mask is given)
+    x=None,
+    overlap=4,
+    alpha=0.8,
+    color=None,
+    linewidth=1,
+    show_labels=False,
+    x_label=0,
+    mask=None,                  # e.g., [True, False, False]
+    labels=None,                # custom labels per repeated ridge (len == len(mask or k))
+    label_rotation=0,
+    label_size=10):
+    if x is None:
+        x = range(df_freq.shape[1])
+
+    v = df_freq.loc[groundtruth].values
+
+    # Determine how many layers to plot
+    if mask is not None:
+        k_eff = len(mask)
+    else:
+        k_eff = k
+        mask = [True] + [False] * (k_eff - 1)  # default: show only first ridge
+
+    H_gt = [v] * k_eff
+    groups = [f"GT{i+1}" for i in range(k_eff)]  # placeholder group names unless labels provided
+
+    plot_discrete_ridges(
+        ax=ax,
+        x=x,
+        H=H_gt,
+        groups=groups,
+        overlap=overlap,
+        alpha=alpha,
+        color=color,
+        linewidth=linewidth,
+        show_labels=show_labels,
+        x_label=x_label,
+        mask=mask,
+        labels=labels,
+        label_rotation=label_rotation,
+        label_size=label_size
+    )
+
+def annotate_axes(
+    axes,
+    texts=None,
+    dates=None,
+    xs=None,
+    tick_size = .7,
+    y_tick_height = -0.1,
+    y_tick_height_last_axis = -0.1,
+    y_date_labels = 0):
+    """
+    Annotate axes with optional category labels on the left
+    and date ticks/labels on the bottom axis.
+
+    Parameters
+    ----------
+    axes : list of Axes
+        Axes objects to annotate.
+    texts : list of str or None, optional
+        Labels for each subplot (reversed order is used).
+        If None, no text is drawn.
+    dates : sequence of datetime, optional
+        Full sequence of dates for labeling.
+    xs : list of int, optional
+        Positions in the date sequence to mark and label.
+    """
+    
+    if xs is None:
+        xs = []
+    xs_dates = []
+    if dates is not None and xs:
+        xs_dates = [dates[i-1].strftime("%-d %b") for i in xs]
+
+    # category labels on the left
+    if texts is not None:
+        for ax, t in zip(axes, texts[::-1]):
+            ax.text(
+                1, .6, t,
+                transform=ax.get_xaxis_transform()
+            )
+
+    #xlimits
+    for ax in axes:
+        ax.set_xlim(1, 27.5)
+
+    # tick marks
+    for ax in axes[:-1]:
+        if xs:
+            ax.plot(
+                xs, [y_tick_height]*len(xs),
+                linestyle='none', marker='|',
+                markersize= tick_size, color='black',
+                zorder = 999,
+                clip_on=False
+            )
+
+    # date labels only on the bottom axis
+    if xs_dates:
+        
+        ax = axes[-1]
+        ax.plot(xs, 
+                [y_tick_height_last_axis]*len(xs),
+                linestyle='none', 
+                marker = '|',
+                markersize = tick_size, 
+                color = 'black',
+                zorder = 999,
+                clip_on = False)
+        
+        for x, label in zip(xs, xs_dates):
+            ax.text(x, 
+                    y_date_labels, 
+                    label,
+                    rotation = 45, 
+                    fontsize = 10,
+                    ha = 'right', 
+                    va = 'top',
+                    transform=ax.get_xaxis_transform(),
+                    clip_on=False)
+
+def panel_metric_dynamic(axes, 
+                         c_freq, 
+                         c,
+                         _ss = config.List_ss_rename,
+                         DICT_colors = config.DICT_colors_ss):
+                         
+    '''
+    axes: axes stacked vertically
+    c_freq: fequency of c
+        - must have index (sparsity, sparsity_level)
+    c : dynamic metric ('day_peak', 'day_last_case', 'day_last_recovery'])
+    _ss : list of sparsity approaches or debiasing approaches
+    '''
+
+    overlap   = 1.5
+    alpha     = 0.8
+    linewidth = 1
+    colors = [DICT_colors[s] for s in _ss]
+    
+    for s, ax in zip(_ss, axes[:-1]):
+        plot_missingness_ridges(
+            df_freq=c_freq,
+            ax=ax,
+            s=s,
+            overlap=overlap,
+            alpha=alpha,
+            color= DICT_colors[s],
+            linewidth=.01,
+            show_labels = True, 
+            label_rotation = 0,
+            labels = ['10-20', '','','', '50-60'])
+        
+        ax.axis('off')
+    
+    ax = axes[-1]
+    plot_groundtruth_ridges(
+        df_freq=c_freq,
+        ax=ax,
+        groundtruth=('ground truth', 'ground truth'),
+        overlap=overlap,
+        alpha=alpha,
+        color=config.COLOR_GT,
+        linewidth=.01,
+        mask = [False,False,False,False,True], 
+        show_labels = True, 
+        labels = ['','','','','0-5'])
+    ax.axis('off')
+    
+    _xs = [1, 8, 15, 22, 27]
+    annotate_axes(axes, 
+                  dates = config.Dates_plus1, 
+                  xs= _xs,
+                  tick_size = 5,
+                  y_tick_height = -.1, 
+                  y_tick_height_last_axis = 2.6, 
+                  y_date_labels = .7)
+    
+    for ax, color in zip(axes, colors):
+    
+        rect = patches.Rectangle((0, .05),          # bottom-left in axes coords
+                                 1, .95,            # full width & height
+                                 transform = ax.transAxes,  # use axes coordinates
+                                 facecolor = color,
+                                 alpha = .4,
+                                 zorder = -1)
+        ax.add_patch(rect)
+    
+    
+    for ax in axes:
+        restyle_ax(ax,
+                   text_size  = config.ax_tick_size, 
+                   title_size = config.ax_label_size)
+
+####################################    
+##### CONTACT VISUALIZATION ########
+####################################
+
+def draw_filled_line(
+    ax,
+    x,
+    y,
+    color,
+    base=0.03,
+    alpha=0.2,
+    lw=1.5,
+    s=10,
+    marker='o',
+    facecolor='none'):
+    """Fill under curve to a base line, then draw line and markers."""
+    
+    ax.fill_between(
+        x, y, base,
+        color=color,
+        alpha=alpha
+    )
+
+    ax.plot(
+        x, y,
+        color=color,
+        linewidth=lw
+    )
+
+    ax.scatter(
+        x, y,
+        edgecolor=color,
+        facecolor=facecolor,  # use facecolor argument
+        s=s,
+        marker=marker
+        
+    )
+
+def to_12h_label(h):
+    """Return '12 am/pm' style label for hour h in [0..23]."""
+    if h == 0:
+        return "12 am"
+    if h < 12:
+        return f"{h} am"
+    if h == 12:
+        return "12 pm"
+    return f"{h-12} pm"
+
+def make_xtick_labels(ticks, start_hour):
+    """Shift ticks by start_hour and format as 12-hour labels."""
+    shifted = [ (t + start_hour) % 24 for t in ticks ]
+    return [to_12h_label(h) for h in shifted]
+
+def legend_weekend_weekday(ax, 
+                           loc='upper left'):
+    legend_elements = [
+        Line2D([0], [0],
+               marker='o',
+               color='black',       # line color (unused here)
+               markerfacecolor='black',
+               markeredgecolor='black',
+               linestyle='None',
+               label='weekday'),
+        Line2D([0], [0],
+               marker='D',
+               color='black',
+               markerfacecolor='none',   # hollow marker
+               markeredgecolor='black',
+               linestyle='None',
+               label='weekend')]
+    
+    ax.legend(handles=legend_elements, loc = loc)
+
+def panel_csa_level(ax, 
+                    df_csa, 
+                    level, 
+                    contact_metric= 'share', 
+                    percent_yticks = True):
+    '''
+    compare the csa (contact share average)
+    over different sparsity approaches for a given sparsity-level
+    '''
+
+    def get_csa(df_csa, 
+                l,
+                wp = 'weekday',
+                s = 'Data driven',
+                hour_order = range(24)):
+        '''
+        get csa values for a specific (wp, s, l)
+        hour_order : ordering of the hour probabilities
+        '''
+        
+        df_wp = df_csa[df_csa['weekperiod']==wp]
+        df_sl = df_wp[(df_wp['sparsity']==s) & (df_wp['sparsity_level'] == str(l))]
+    
+        df_sl = df_sl.set_index('hourofday').loc[hour_order]
+        return df_sl[contact_metric].values
+    
+    start_hour = 8
+    hour_order = list(range(start_hour,24)) + list(range(0,start_hour))
+    
+    for marker, wp in zip(['o','D'], 
+                          ['weekday','weekend']):
+    
+        x = range(24)
+        for s in config.List_ss_rename:
+            y_csa = get_csa(df_csa, 
+                            l = level,
+                            wp = wp, 
+                            s = s,
+                            hour_order= hour_order)
+    
+            c = config.DICT_colors_ss[s]
+            draw_filled_line(ax, 
+                             x, y_csa, 
+                             color = c ,
+                             base=0, alpha= 0.1, lw=.5, s=20, 
+                             marker= marker, 
+                             facecolor = c if (wp =='weekday') else 'none')
+    
+    _xticks = [0, 6, 12, 18, 23]
+    _xticks_labels = make_xtick_labels(_xticks, start_hour)
+    ax.set_xticks(_xticks)
+    ax.set_xticklabels(_xticks_labels, rotation=45)
+    
+    # titles / labels
+    ax.set_xlabel("hour of day")
+    if percent_yticks: 
+        set_percent_yticks(ax, decimals=0)
+
+    ax.grid(axis="x", linestyle="-", color="gray", alpha=0.7)
+
+def rsq(df, col1, col2, corr_type = 'pearson_r2'):
+    if corr_type =='pearson_r2':
+        return (df[col1].corr(df[col2]))
+    else:
+        return r2_score(df[col1], df[col2])
+
+def ax_colorbar_inset(ax):
+
+    # clear axis
+    ax.clear()
+    
+    # colormap + norm
+    cmap = plt.get_cmap("Blues")
+    norm = mpl.colors.Normalize(vmin=0, vmax=23)
+    
+    # horizontal colorbar inside this axis
+    cbar = plt.colorbar(
+        mpl.cm.ScalarMappable(norm=norm, cmap=cmap),
+        cax=ax,
+        orientation='horizontal'
+    )
+    
+    # ----- DEFINE MAJOR / MINOR TICKS -----
+    
+    minor_ticks = np.arange(24)                      # 0..23
+    major_ticks = np.array([0, 12, 23])       # labels only here
+    
+    cbar.set_ticks(major_ticks)                      # major ticks
+    cbar.ax.set_xticks(minor_ticks, minor=True)      # add minor ticks
+    
+    # ----- SET TICK LABELS ONLY FOR MAJORS -----
+    
+    major_labels = [
+        '8 am',      # hour 0
+        '8 pm',     # hour 12
+        '7 am'       # hour 23
+    ]
+    
+    cbar.set_ticklabels(major_labels, size=10)
+    
+    # optional style
+    #ax.set_xlabel('hour of day')
+    restyle_ax(ax, label_size=config.ax_tick_size)
+    
+    # ensure horizontal alignment
+    for label in cbar.ax.get_xticklabels():
+        label.set_rotation(0)
+
+def _binned_percentile_yvals(df, 
+                             x_col, y_col, 
+                             x_bins, 
+                             percentile,
+                             use_weight=True, 
+                             weight_col="weight"):
+    """
+    Return a 1D float array of length len(x_bins) with NaN at the left edge.
+    """
+    df = df[[x_col, y_col] + ([weight_col] if use_weight else [])].dropna()
+    x_idx = np.digitize(df[x_col].to_numpy(), x_bins)
+
+    def _to_scalar(q):
+        # coerce np.array / np.ndarray / pandas scalar to Python float or np.nan
+        if q is None:
+            return np.nan
+        q_arr = np.asarray(q, dtype=float).reshape(-1)
+        return q_arr[0] if q_arr.size else np.nan
+
+    q_by_xbin = {}
+    p = float(percentile) / 100.0
+
+    for i in range(1, len(x_bins)):
+        mask = (x_idx == i)
+        if not mask.any():
+            q_by_xbin[i] = np.nan
+            continue
+
+        vals = df.loc[mask, y_col].to_numpy()
+        if use_weight:
+            w = df.loc[mask, weight_col].to_numpy()
+            q = DescrStatsW(data=vals, weights=w).quantile(probs=p, return_pandas=False)
+        else:
+            q = np.nanquantile(vals, p)
+
+        q_by_xbin[i] = _to_scalar(q)
+
+    # prepend NaN for the left edge so indexing aligns with bins
+    y_vals = [np.nan] + [q_by_xbin.get(i, np.nan) for i in range(1, len(x_bins))]
+    
+    return np.asarray(y_vals, dtype=float)
+
+def plot_binned_percentile(ax,
+                           _df,
+                           x_col, y_col,
+                           x_bins, y_bins,
+                           percentile=50,
+                           color='cyan',
+                           linestyle='-',
+                           linewidth=2,
+                           scatter=False,
+                           scatter_size=1,
+                           use_weight = True, 
+                           weight_col = "weight",
+                           bin_non_linear=False,   # <--- NEW
+                           no_binning = False,
+                           _plot = True,
+                           **kwargs):
+    """
+    Plot a percentile line over a binned heatmap.
+    If bin_non_linear=True, y is mapped to bin coordinates using the actual (possibly non-uniform) y_bins.
+    Otherwise, a linear rescale (uniform bins) is applied as before.
+    """
+    # 1) Get percentile y at each x-bin (in DATA units)
+    y_vals = _binned_percentile_yvals(_df, x_col, y_col, x_bins, 
+                                      percentile, 
+                                      use_weight = use_weight, 
+                                      weight_col = weight_col)
+    
+    if no_binning:
+        ax.scatter(x_bins, y_vals, color=color, s=scatter_size)
+    else:
+        # 2) Map y to heatmap coordinates
+        if bin_non_linear:
+            y_rescaled = map_values_to_bincoords(y_vals, y_bins, fractional=True)
+        else:
+            y_rescaled = rescale_to_bins(y_vals, y_bins)
+    
+        # 3) x mapping (keep your original)
+        x_rescaled = (x_bins - x_bins[0]) / (np.diff(x_bins)[1]) - 0.5
+    
+        # 4) draw
+        if _plot:
+            ax.plot(x_rescaled, y_rescaled, color=color, linestyle=linestyle, linewidth=linewidth, **kwargs)
+        if scatter:
+            ax.scatter(x_rescaled, y_rescaled, color=color, s=scatter_size)
+
+def panels_missing_users_detected_contacts(axes, 
+                                           df_merged, 
+                                           l):
+    '''
+    visualize detected contacts vs. missing users
+    for a given range under different sparsity approaches
+    '''
+    _LS = config.List_ss_rename
+    x_metric= 'missing_users_perc'
+
+    for ax, s in zip(axes, _LS):
+        
+        df_s = df_merged[df_merged['sparsity'] == s]
+        dict_level_df_s = subset_df_feature(df_s, 'sparsity_level').copy()
+    
+        #setting the colorbar for the hour
+        start_hour = 8
+        df_sl = dict_level_df_s[str(l)].copy()
+        df_sl['hourofday'] += (24 - start_hour)
+        df_sl['hourofday'] %= 24
+    
+        scatter_df(ax, 
+                   df_sl, 
+                   x = x_metric, 
+                   y = 'count_contacts',
+                   y_rename = '', 
+                   x_rename = '',
+                   s = .1,
+                   #c = DICT_colors_ss[s])
+                   c = df_sl['hourofday'],
+                   cmap = 'Blues', 
+                   colorbar=False)
+    
+        bin_users = np.arange(.0,.9,.05) 
+        bin_contacts = np.linspace(10,1e3, 20)
+
+        plot_binned_percentile(ax,
+                               df_sl,
+                               x_metric, 
+                               'count_contacts', 
+                               bin_users, 
+                               bin_contacts, 
+                               percentile=50,
+                               color='black',
+                               linestyle = '-',
+                               linewidth = 2,
+                               scatter=True,
+                               scatter_size = 5,
+                               use_weight = False, 
+                               weight_col = "weight",
+                               bin_non_linear=True,   # <--- NEW
+                               _plot = False, 
+                               no_binning = True)
+    
+        
+        ax.set_yscale('log')
+        
+        #ax.set_xlim(0.2,0.75)
+        ax.set_ylim(2,1.2e3)
+    
+        R2 = rsq(df_sl, 
+                 x_metric, 
+                 'count_contacts')
+        
+        ax.text(0.98, 0.02,                      # (x,y) bottom-right
+                fr"$\rho = {R2:.2f}$",         # latex-style rho^2
+                transform=ax.transAxes,
+                ha="right", va="bottom",
+                fontsize=10,
+            )
+        ax.set_title(s)
+    
+        if s != _LS[-1]:
+            ax.set_xlabel('')
+            #remove_axis_ticktext(ax, axis= 'x')
+
+    axes[0].set_ylabel('detected contacts')
+    axes[1].set_xlabel('missing users (%)')
+
+#########################################
+#### GAP DISTRIBUTION AND ENTROPIES #####
+#########################################
+
+def panel_gap_distribution(ax, 
+                           df_gap_count,
+                           level= '40-50',
+                           fill_alpha = 0.18,
+                           hours_select = range(1,13), 
+                           ax_ticks = True):
+    '''
+    visualize the gap duration distribution for a sample of sequences withi a range of missing hours
+    df_gap_count: df of gap durations
+    level: level of missing hours (from 0-10 to 90-100)
+    '''
+
+    
+    
+    #subset the gap count dataframe by the level of missing hours                    
+    df_gap_count_level = df_gap_count[df_gap_count['missing_hours'] == level]
+    
+    df_gcl = df_gap_count_level.pivot(index = 'gap_duration_hours', 
+                                      columns = 'sparsity', 
+                                      values = 'count').fillna(0)
+    
+    #normalize column counts to obtain the probability for each gap duration
+    df_gcl = df_gcl.div(df_gcl.sum(axis=0), axis=1)
+    
+    
+    
+    for s in ['Data driven', 'Random uniform']:
+        y = df_gcl.loc[hours_select, s].values
+        x = np.arange(len(y))  # 0..11
+        
+        # area
+        ax.fill_between(
+            x, 0, y,
+            color = config.DICT_colors_ss[s],
+            alpha = fill_alpha,
+            zorder = 0
+        )
+    
+        # line
+        ax.plot(
+            x, y,
+            color=config.DICT_colors_ss[s])
+        
+        # points
+        ax.scatter(
+            x, y,
+            color=config.DICT_colors_ss[s],
+            s=10)
+
+    if ax_ticks: 
+        yticks = ax.get_yticks()
+        ax.set_yticks(yticks)
+        ax.set_yticklabels([f"{y*100:.0f}" for y in yticks])
+        ax.set_ylim(0,.8)
+        ax.set_ylim(1e-5,1.1)
+        ax.set_yscale('log')   # for y-axis
+        
+        # choose the major tick positions
+        major_ticks = [0, 5, 11]#, 17, 23]
+        # set axis limits that include all major ticks
+        ax.set_xlim(-.25, 11)
+        # major ticks and labels
+        ax.set_xticks(major_ticks)
+        ax.set_xticklabels([str(t+1) for t in major_ticks])
+        # minor ticks (optional): every hour
+        ax.xaxis.set_minor_locator(ticker.MultipleLocator(1))
+        # style
+        ax.tick_params(axis="x", which="major", length=6, width=1)
+        ax.tick_params(axis="x", which="minor", length=3, width=0.8)
+
+def plot_kde(ax, x, color, label=None, fill_alpha=0.35, ls='-', lw=1.5, z=1):
+    '''
+    plot gaussian kernel density estimation for a given array
+    '''
+    from scipy.stats import gaussian_kde
+    x = np.asarray(x.dropna())
+    kde = gaussian_kde(x)
+    xx = np.linspace(x.min(), x.max(), 500)
+    yy = kde(xx)
+    if fill_alpha > 0:
+        ax.fill_between(xx, yy, 0, color=color, alpha=fill_alpha, zorder=z)
+    ax.plot(xx, yy, color=color, lw=lw, ls=ls, zorder=z+1, label=label)
+    return xx, yy
+
+def panel_sequence_entropies(ax,
+                             df_sequence_entropies,
+                             level_missing_hours = '40-50',
+                             alpha = 0.35):
+
+    df_sequence_entropies_level = df_sequence_entropies[df_sequence_entropies['missing_hours'] == level_missing_hours]
+
+    for s in ['Data driven', 'Random uniform']:
+
+        plot_kde(ax,
+                 df_sequence_entropies_level[s],
+                 color= config.DICT_colors_ss[s],
+                 fill_alpha=alpha)
+
+
+################################    
+##### CALIBRATION OUTCOMES #####
+################################
+
+def visual_grid_R0_global(ax, 
+                          df_GRID_sub, 
+                          x = 'beta', 
+                          y = 'gamma',
+                          cmap = 'Greys', 
+                          R0_column = 'R0_global_mean',
+                          levels = 20, 
+                          R0_min =0, 
+                          R0_max =7,
+                          cbar = True, 
+                          cbar_title = 'mean R0',
+                          contour_lines=None,  # pass a list of R0 values for contour lines
+                          contour_line_color='k',
+                          contour_line_style='--', 
+                          manual_clabel = False, 
+                          alpha = 1, 
+                          inset_kw_arg = None, 
+                          symmetric_cbar = False,
+                          sym_linthresh = 1e-3):
+
+    from matplotlib.colors import Normalize, SymLogNorm
+    from matplotlib.cm import ScalarMappable
+    
+    # ---- choose normalization ----
+    if symmetric_cbar:
+        vmax_sym = max(abs(R0_min), abs(R0_max))
+        norm = SymLogNorm(linthresh=sym_linthresh, vmin=-vmax_sym, vmax=vmax_sym, base=10)
+        max_pow = int(np.floor(np.log10(vmax_sym)))
+        pos_ticks = [10**k for k in range(0, max_pow + 1)]
+        neg_ticks = [-t for t in reversed(pos_ticks)]
+        ticks = neg_ticks + [0] + pos_ticks
+    else:
+        ticks = np.arange(R0_min, R0_max + 1, 1)
+        norm = Normalize(vmin=R0_min, vmax=R0_max)
+        
+    # Filled contour plot
+    tcf = ax.tricontourf(
+        df_GRID_sub[x],
+        df_GRID_sub[y],
+        df_GRID_sub[R0_column],
+        levels=levels,
+        cmap=cmap, 
+        norm = norm,
+        vmin=0, 
+        vmax=R0_max + 1,
+        alpha=alpha)
+    
+    # Add contour lines if requested
+    if contour_lines is not None:
+        contours = ax.tricontour(
+            df_GRID_sub[x],
+            df_GRID_sub[y],
+            df_GRID_sub[R0_column],
+            levels=contour_lines,
+            colors=contour_line_color,
+            linestyles=contour_line_style,
+            linewidths=1, 
+            alpha = alpha)
+        
+        offset_x = 0
+        offset_y = 0
+        if manual_clabel is not False:
+            labels = ax.clabel(contours, inline=True, fontsize=10, 
+                               manual = manual_clabel)
+            for txt in labels:
+                x, y = txt.get_position()
+                txt.set_position((x + offset_x, y + offset_y))  # offset_x > 0 moves to the rightc
+                #txt.set_color('white')
+    
+    if cbar:
+        inset_kw = dict(
+            width="40%",
+            height="4%",
+            loc='lower center',
+            bbox_to_anchor=(0.1, 0.7, 1, 1),
+            bbox_transform=ax.transAxes,
+            borderpad=1
+        )
+        if inset_kw_arg is not None:
+            inset_kw.update(inset_kw_arg)
+        cax = inset_axes(ax, **inset_kw)
+
+        sm = ScalarMappable(norm=norm, cmap=cmap)
+        sm.set_array([])
+        # Create horizontal colorbar using dummy ScalarMappable
+        cbar = plt.colorbar(sm, cax=cax, orientation='horizontal')
+
+            
+        cbar.set_ticks(ticks)
+        cbar.set_ticklabels([f"{t:g}" for t in ticks])
+    
+        cbar.ax.xaxis.set_label_position('top')
+        cbar.ax.xaxis.set_ticks_position('bottom')
+        cbar.set_label(
+            cbar_title,
+            size=12,
+            labelpad=5,
+            bbox=dict(facecolor='white', edgecolor='none', pad=1)
+        )
+    
+        for tick in cbar.ax.xaxis.get_ticklabels():
+            tick.set_color('white')
+
+def visual_GRID_R0(ax, 
+                  df_GRID, 
+                  x = 'gamma',
+                  y = 'beta',
+                  R0_column = 'R0_global_mean',
+                  beta_range = None,
+                  gamma_range = None, 
+                  grid_levels = 4, 
+                  contour_lines = None, 
+                  manual_clabel = False,
+                  cmap = 'gist_yarg',
+                  cbar = False, 
+                  cbar_title = '',
+                  scatter_size =1, 
+                  alpha =1, 
+                  R0_min = 1,
+                  R0_max = 7,
+                  inset_kw_arg = None, 
+                  symmetric_cbar = False): 
+
+    if beta_range is not None:
+        df_GRID = df_GRID[df_GRID['beta'].between(beta_range[0], beta_range[1])]
+    if gamma_range is not None:
+        df_GRID = df_GRID[df_GRID['gamma'].between(gamma_range[0], gamma_range[1])]
+
+    visual_grid_R0_global(ax, 
+                          df_GRID, 
+                          R0_column = R0_column,
+                          levels = grid_levels,
+                          R0_min = R0_min,
+                          R0_max = R0_max,
+                          contour_lines = contour_lines,
+                          cbar = cbar,
+                          cbar_title = cbar_title,
+                          x = x, 
+                          y = y, 
+                          manual_clabel = manual_clabel,
+                          cmap = cmap, 
+                          alpha =alpha, 
+                          inset_kw_arg = inset_kw_arg,
+                          symmetric_cbar = symmetric_cbar)
+    
+    scatter_df(ax, 
+            df_GRID, 
+            x, 
+            y, 
+            s = scatter_size,
+            c = df_GRID[R0_column].values, 
+            cmap = plt.cm.gist_yarg, 
+            vmin =0,
+            vmax=4,
+            colorbar = False,
+            colorbar_label = '$\overline{R}_0$')#fontsize_cbar = 20)
+
+def visual_pars_med_ci(ax,
+                       df_pars_stats, 
+                       x = 'beta',
+                       y = 'gamma',
+                       capsize=4,
+                       elinewidth=1.2,
+                       markeredgewidth=0.80):
+    '''
+    visualize median and 95%CI 
+    of pars (x,y) for different levels of sparsity    
+    '''
+
+    df = df_pars_stats.copy()
+    df = df.loc[[str(l) for l in config.Levels]]
+       
+    #Median values
+    X = df[f'{x}_med'].values
+    Y = df[f'{y}_med'].values
+
+    #Confidence interval values
+    X_wl = df[f'{x}_whislo'].values
+    Y_wl = df[f'{y}_whislo'].values
+    X_wh = df[f'{x}_whishi'].values
+    Y_wh = df[f'{y}_whishi'].values
+    
+    for i, col in enumerate(config.COLORS_LEVEL):
+        ax.errorbar(X[i], Y[i],
+                    xerr=[[X[i] - X_wl[i]], [X_wh[i] - X[i]]],
+                    yerr=[[Y[i] - Y_wl[i]], [Y_wh[i] - Y[i]]],
+                    fmt= 'o',
+                    color=col,
+                    ecolor=col,
+                    capsize= capsize,
+                    elinewidth= elinewidth,
+                    markeredgewidth= markeredgewidth)
+
+def visual_gt_par(ax, 
+                  groundtruth_pars, 
+                  x = 'beta', 
+                  y = 'gamma', 
+                  s = 30):
+    '''
+    visualization of the ground truth parameters 
+    '''
+    ax.scatter(
+        groundtruth_pars[x],
+        groundtruth_pars[y],
+        facecolors=config.COLOR_GT,
+        s=s,
+        marker='D',
+        edgecolors=config.COLOR_GT,
+        zorder=999)
+
+def visual_fitted_params(ax, 
+                         df_fpc_stats, 
+                         df_R0_grid_estimates, 
+                         beta_grid_range, 
+                         gamma_grid_range,
+                         R0_min, 
+                         R0_max,
+                         groundtruth_pars,
+                         grid_levels,
+                         List_mc): 
+
+    '''
+    df_fpc : stats of fitted parameters
+    df_R0_grid_estimates: grid of esitimated R0 value
+    (beta_grid_range, gamma_grid_range): select grid for the range
+    (R0_min, R0_max): min, max R0 for the colorbar 
+    groundtruth_pars: dictionary containing the ground truth simulation parameters
+    grid_levels : number of plotted levels over the contour plot of the R0 heatmap
+    List_mc : list of ax coordinates for labeling of the contour lines (has same len of grid_levels)
+    '''
+    #visualize median and confidence interval of the estimated parameters
+    visual_pars_med_ci(ax,
+                       df_fpc_stats, 
+                       x = 'beta',
+                       y = 'gamma',
+                       capsize=4,
+                       elinewidth=1.2,
+                       markeredgewidth=0.80)
+    
+    #visualize the underlying grid of R0 values 
+    visual_GRID_R0(ax, 
+                  df_R0_grid_estimates, 
+                  y = 'gamma',
+                  x = 'beta',
+                  cmap = 'Blues',
+                  R0_column = 'R0_mean',
+                  beta_range = beta_grid_range,
+                  gamma_range = gamma_grid_range, 
+                  R0_min = R0_min,
+                  R0_max= R0_max,
+                  grid_levels = grid_levels, 
+                  contour_lines = grid_levels, 
+                  manual_clabel = List_mc,
+                  cbar = False, 
+                  #cbar_title = 'ground truth $\overline{R}_0$',
+                  scatter_size=.001)
+
+    #visualize the ground truth parameters 
+    visual_gt_par(ax, 
+                  groundtruth_pars, 
+                  x = 'beta', 
+                  y = 'gamma', 
+                  s = 30)
+
+
+################################    
+##### OUTCOMES FROM CUEBIQ #####
+################################
+
+def process_cov_share_data(cov_share_sw, 
+                           sws = 30):
+    '''
+    process the data of coverage share from cuebiq for a given sliding window renaming consistently the variables
+    sws: sliding window size (possible values are 7, 14, 21, 30, 50)
+    '''
+
+    cov_share_sw['DATE'] = pd.to_datetime(cov_share_sw['DATE']) 
+    
+    cols_old = ['DATE', 
+                '0.9–1.0', '0.8–0.9', '0.7–0.8', '0.6–0.7', '0.5–0.6','0.4–0.5', '0.3–0.4', '0.2–0.3', '0.1–0.2', '0.0–0.1', 
+                'WINDOW_DAYS']
+    
+    cols_new = ['DATE', 
+                '0-10', '10-20', '20-30', '30-40', '40-50','50-60', '60-70', '70-80', '80-90', '90-100', 
+                'WINDOW_DAYS']
+    
+    dict_rename_cols = dict(zip(cols_old, cols_new))
+    cov_share_sw.columns = [dict_rename_cols[c] for c in cov_share_sw.columns]
+    
+    sw_sizes  = cov_share_sw['WINDOW_DAYS'].unique()
+    sws_share = cov_share_sw[cov_share_sw['WINDOW_DAYS'] == sws].set_index('DATE').drop('WINDOW_DAYS', 
+                                                                                        axis = 1)
+    
+    return sws_share
+
+def viz_coverage(ax,
+                 cov_share_sw, 
+                 sws = 7, 
+                 date_range = None, 
+                 date_step =10):
+
+    sws_share = cov_share_sw[cov_share_sw['WINDOW_DAYS'] == sws].set_index('DATE').drop('WINDOW_DAYS', axis = 1)
+    df = sws_share.copy()
+    if date_range is not None:
+        df = df.loc[date_range]
+    
+    cmap = cm.get_cmap("coolwarm")     # blue→red
+    colors = [cmap(i) for i in np.linspace(0, 1, df.shape[1])]
+    
+    df.plot(kind='bar',
+            stacked=True,
+            ax=ax,
+            width=1.1,
+            color=colors)
+        
+    df.index = pd.to_datetime(df.index)
+    
+    ax.set_xticks(range(0, len(df), date_step))
+    ax.set_xticklabels(df.index[::date_step].strftime("%m-%d"), rotation=90)
+    ax.set_title(f'{sws} days')
+
+def convert_mmdd_to_ddmon(ax):
+    """Convert xticklabels from 'MM-DD' to 'DD Mon' format."""
+    labels = ax.get_xticklabels()
+    new_labels = []
+    
+    for lbl in labels:
+        txt = lbl.get_text()
+        if "-" in txt:
+            try:
+                m, d = txt.split("-")
+                date = dt.datetime(2000, int(m), int(d))   # dummy year
+                new_labels.append(date.strftime("%d %b"))
+            except:
+                new_labels.append(txt)
+        else:
+            new_labels.append(txt)
+
+    ax.set_xticklabels(new_labels)
+
+def panel_spectus_curves(ax_top, 
+                         ax_left, 
+                         ax_right, 
+                         curves, 
+                         Curve_ref):
+    
+    #[0] TOP LEGEND
+    legend_elements = [
+        Patch(facecolor= config.COLOR_GT, label = 'Reference'),
+        Patch(facecolor= config.COLOR_CALIB_BS ,label = 'Calib. on biased contacts'),
+        Patch(facecolor= config.COLOR_CALIB_CC ,label = 'Calib. on rescaled contacts')]
+    
+    ax_top.legend(handles = legend_elements,
+                  title = '',
+                  loc = 'center',
+                  ncol = 3,                # two columns
+                  columnspacing = 1.5,     # space between columns
+                  handletextpad = 0.5,
+                  fontsize = 9,
+                  framealpha=1,         # fully opaque
+                  facecolor="white",    # white background
+                  edgecolor="black")     # optional: black border
+
+    ax_top.axis('off')
+    
+    #[1] CURVES AND BOXPLOT OF TOTAL INFECTED
+    axes = [ax_left, ax_right]
+    alpha = 0.4
+
+    ax = axes[0]
+    _m = 'percentage'
+    t  = 'calib_sparse'
+    c_tm = curves[(curves['TYPE'] == t) & (curves['REFERENCE']== _m)].copy()
+    c_tm['CI'] /= 855
+    c_tm_list = [k[['S','CI']].values for c,k in subset_df_feature(c_tm, 'N_iter').items()]
+    
+    visual_curves_SI_spectus(ax, c_tm_list, visual_all_sims= True, color = config.COLOR_CALIB_BS, alpha = alpha)
+    
+    t  = 'calib_cc'
+    c_tm = curves[(curves['TYPE'] == t) & (curves['REFERENCE']== _m)].copy()
+    c_tm['CI'] /= 855
+    c_tm_list = [k[['S','CI']].values for c,k in subset_df_feature(c_tm, 'N_iter').items()]
+    visual_curves_SI_spectus(ax, c_tm_list, visual_all_sims= True, color = config.COLOR_CALIB_CC, alpha = alpha)
+    remove_axis_ticktext(ax, axis='x')
+    ax.set_xticks(range(0,90,20))
+    ax.set_xticklabels(range(0,90,20), rotation =0)
+    ax.plot(Curve_ref.values, c = config.COLOR_GT)
+    ax.set_xlabel('simulation day')
+    ax.set_xlim(0,89)
+
+    ax = axes[1]
+    
+    _m = 'percentage'
+    
+    t  = 'calib_sparse'
+    c_tm = curves[(curves['TYPE'] == t) & (curves['REFERENCE']== _m)].copy()
+    c_tm['CI'] /= 855
+    CI_sparse = c_tm.groupby('N_iter').agg({'CI':max})
+    CI_sparse_stats = {f:c(CI_sparse['CI']) for f,c in funcs.items()}
+    
+    t  = 'calib_cc'
+    c_tm = curves[(curves['TYPE'] == t) & (curves['REFERENCE']== _m)].copy()
+    c_tm['CI'] /= 855
+    CI_cc = c_tm.groupby('N_iter').agg({'CI':max})
+    CI_cc_stats = {f:c(CI_cc['CI']) for f,c in funcs.items()}
+    
+    custom_boxplot_from_stats(ax, 
+                              [CI_sparse_stats], 
+                              positions=[0], 
+                              color = config.COLOR_CALIB_BS, face_alpha = .8)
+    
+    ax.scatter(0, CI_sparse_stats['mean'], color = 'black', s= 20, zorder= 100)
+    
+    custom_boxplot_from_stats(ax, 
+                              [CI_cc_stats], 
+                              positions=[1], 
+                              color = config.COLOR_CALIB_CC, face_alpha = .8)
+    
+    ax.scatter(1, CI_sparse_stats['mean'], color = 'black', s= 20, zorder = 100)
+    remove_axis_ticktext(ax, axis='x')
+    ax.set_ylabel('total infected (%)')
+    
+    axes[0].set_ylabel('cumulative infected (%)')
+    set_percent_yticks(axes[0], decimals= 0)
+    set_percent_yticks(axes[1], decimals= 0)
+    
+    ax.axhline(Curve_ref.values[-1], color = config.COLOR_GT)
 
 

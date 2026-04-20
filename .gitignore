@@ -3,3 +3,15 @@ pycache/
 .ipynb_checkpoints/
 .env
 *.csv
+
+# Excluded from version control
+Pipeline_output_DTU/
+Nomad/
+Old_code/
+geolife-plus/
+rename*.py
+test*.ipynb
+Figures_and_Tables_updated.ipynb
+Creation_synthetic_dataset.ipynb
+TODO.txt
+*.pkl
