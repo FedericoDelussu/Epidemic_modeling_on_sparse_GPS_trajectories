@@ -17,8 +17,7 @@ Here, we introduce a data-driven framework to measure the effect of GPS trajecto
 This framework has been applied to the Danish Technical University campus dataset, collected as part of a 2.5-year experiment started in 2013, involving over 1,000 students who were each provided with a mobile phone collecting their individual GPS locations. See *Stopczynski, A., Sekara, V., Sapiezynski, P., Cuttone, A., Madsen, M. M., Larsen, J. E., & Lehmann, S. (2014). Measuring large-scale social networks with high resolution. PLoS ONE, 9(4), e95978* for reference.
 
 The package is implemented in Python using NumPy, Pandas, scikit-mobility, and Matplotlib for GPS data processing, location data analysis, epidemic modeling, and visualization.
-
-This work resulted in the preprint **[The Effect of Mobility Trajectory Sparsity on Epidemic Modeling Outcomes](https://arxiv.org/abs/2605.31282)**.
+This work is currently a preprint **[The Effect of Mobility Trajectory Sparsity on Epidemic Modeling Outcomes](https://arxiv.org/abs/2605.31282)**.
 
 # Main findings
 
@@ -28,10 +27,9 @@ Epidemic modeling experiments on GPS location data consist of (1) **stop detecti
 
 We reproduce empirical missingness through a sparsity model in which we pick a sparse trajectory within a specific range of sparsity and add its sequence of gaps to the complete trajectory to obtain a trajectory with missing records.
 
-We use the originally complete trajectories as a reference to obtain ground truth infection predictions from the epidemic SIR model.
-
 ![image](Imgs/sparsification.png)
 
+We use the originally complete trajectories as a reference to obtain ground truth infection predictions from the epidemic SIR model.
 Comparing the ground truth results to those with increasing levels of sparsity, we observe a drastic decrease in the total number of predicted infections and in the occurrence of realized outbreaks.
 
 ![image](Imgs/bias_estimation.png)
