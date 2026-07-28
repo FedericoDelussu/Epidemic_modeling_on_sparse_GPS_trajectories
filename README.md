@@ -25,5 +25,4 @@ Epidemic modeling experiments on GPS location data consist of (1) stop detection
 We reproduce empirical missingness through a sparsity model in which we pick a sparse trajectory within a specific range of sparsity and add its sequence of gaps into the complete trajectory to obtain a complete trajectory with missing records. Comparing the ground truth results obtained from complete trajectories to those with increasing levels of sparsity, we observe a drastic decrease in the total number of predicted infections and in the occurrence of realized outbreaks.
 
 We then propose a bias correction methodology, which consists of calibrating the rescaled estimated contacts. The rescaling is based on inverse probability weighting according to the trajectory's level of sparsity.
-
 We measure that this strategy consistently recovers both the bias in epidemic predictions and the bias in the parameter estimation obtained from calibration.
